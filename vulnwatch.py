@@ -702,6 +702,54 @@ def git(repo_dir, *args, timeout=300):
                 + list(args), timeout)
 
 
+def git_bytes(repo_dir, *args, timeout=300):
+    """git() with the output as bytes. Text mode would turn a bare carriage return into a newline, and a
+    line that git and the checks see as one would then be two for them but one for a YAML or pip parser."""
+    cmd = ["git", "-C", repo_dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"] + list(args)
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env())
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("git %s timed out" % args[0])
+    if p.returncode != 0:
+        raise RuntimeError("git %s failed: %s" % (args[0], p.stderr.decode("utf-8", "replace").strip()[-200:]))
+    return p.stdout
+
+
+def raw_diff(repo_dir, *args, paths=False):
+    """`git diff` for every check and for the reviewer. A .gitattributes in the repo (-diff, binary, diff=
+    with a textconv or external driver) must not decide what they get to see, so each file is diffed as
+    plain text. Renames are a delete plus an add. Invalid UTF-8 in file content is replaced, not fatal.
+    With `paths=True` the output is file names, which must stay exact: an invalid name is an error, since
+    a mangled one would make a check read a file that is not there. Names are written as they are, not
+    quoted with octal escapes."""
+    out = git_bytes(repo_dir, "-c", "core.quotePath=false", "diff", "--text", "--no-textconv", "--no-ext-diff",
+                    "--no-renames", *args)
+    return out.decode("utf-8") if paths else out.decode("utf-8", "replace")
+
+
+def changed_paths(repo_dir, base):
+    """Every path the branch changes against the base. Taken from the local commit: GitHub's list of a
+    pull request's files stops at about 100, so a bigger change could hide a file from the merge rules."""
+    return [p for p in raw_diff(repo_dir, "--name-only", "-z", "origin/%s...HEAD" % base, paths=True).split("\0") if p]
+
+
+# Git writes a name holding one of these in quotes even with core.quotePath off. A diff header with one is
+# not parsed here (the checks would read the path with its quotes), so a branch that touches such a name is
+# refused. A dependency fix never needs one.
+GIT_QUOTED = re.compile(r'["\\\x00-\x1f\x7f]')
+
+
+def quoted_names(paths):
+    return [p for p in paths if GIT_QUOTED.search(p)]
+
+
+def diff_lines(text):
+    """The lines of git output, split on newlines only. str.splitlines() also breaks at U+0085, U+2028,
+    U+2029 and others, so a file name or a line of content holding one followed by `diff --git a/x b/x`
+    would start a section git never wrote, and the lines after it would be checked as another file."""
+    return [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+
+
 BIG_LOCK_SECTION = 100_000
 HASH_LINE = re.compile(r"""^[-+]\s*"?(integrity|checksum|hash|shasum)"?\s*[:=]\s*\S+[,]?\s*$|^[-+]\s*(--hash=)?sha\d+[:-][A-Za-z0-9+/=]+\s*\\?\s*$""")
 REGISTRY_HOSTS = {"registry.npmjs.org", "registry.yarnpkg.com", "files.pythonhosted.org", "pypi.org",
@@ -711,7 +759,7 @@ REGISTRY_HOSTS = {"registry.npmjs.org", "registry.yarnpkg.com", "files.pythonhos
 
 def split_diff(diff):
     sections, cur = [], None
-    for line in diff.splitlines():
+    for line in diff_lines(diff):
         if line.startswith("diff --git"):
             cur = [line.split(" b/", 1)[-1], [line]]
             sections.append(cur)
@@ -726,7 +774,7 @@ def foreign_sources(diff):
     for path, text in split_diff(diff):
         if os.path.basename(path) not in LOCKFILES:
             continue
-        for line in text.splitlines():
+        for line in diff_lines(text):
             if line.startswith("+"):
                 hosts |= {h.lower() for h in re.findall(r"https?://([^/\s\"']+)", line)} - REGISTRY_HOSTS
     return sorted(hosts)
@@ -735,7 +783,7 @@ def foreign_sources(diff):
 def review_diff(repo_dir, base):
     """The branch diff for review, from the trusted checkout. Returns (diff, foreign hosts);
     diff is None if it is too big to review even after reduce_diff."""
-    diff = git(repo_dir, "diff", "origin/%s...HEAD" % base)
+    diff = raw_diff(repo_dir, "origin/%s...HEAD" % base)
     return reduce_diff(diff), foreign_sources(diff)
 
 
@@ -747,8 +795,8 @@ def reduce_diff(diff):
     parts = []
     for path, text in split_diff(diff):
         if os.path.basename(path) in LOCKFILES and len(text) > BIG_LOCK_SECTION:
-            kept = [l for l in text.splitlines()[1:] if l[:1] in "+-" and not HASH_LINE.match(l)]
-            parts.append(text.splitlines()[0] + "\n(large lockfile: unchanged context and integrity hashes omitted; every other changed line shown)\n" + "\n".join(kept))
+            kept = [l for l in diff_lines(text)[1:] if l[:1] in "+-" and not HASH_LINE.match(l)]
+            parts.append(diff_lines(text)[0] + "\n(large lockfile: unchanged context and integrity hashes omitted; every other changed line shown)\n" + "\n".join(kept))
         else:
             parts.append(text)
     text = "\n".join(parts)
@@ -955,7 +1003,7 @@ def revert_if_main_breaks(repo, pr, trusted, base, short, url):
     rurl = must(["gh", "pr", "create", "-R", repo, "--base", base, "--head", rbranch,
                  "--title", "Revert security fix that broke %s" % base, "--body", body], 120, trusted).strip()
     rpr = int(rurl.rstrip("/").rsplit("/", 1)[-1])
-    agree, _ = sol_review(body, git(trusted, "diff", "origin/%s...HEAD" % base), "")
+    agree, _ = sol_review(body, raw_diff(trusted, "origin/%s...HEAD" % base), "")
     if not agree:
         return " It broke checks on main. Revert is ready but the reviewer didn't agree: %s" % rurl
     if checks_state(repo, rsha, pr_workflows(trusted)) in ("fail", "error"):
