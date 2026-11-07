@@ -1649,6 +1649,24 @@ def pip_sources_changed(repo_dir, base, path):
     return new is None or (old or []) != new
 
 
+# Lockfile text that installs from somewhere other than a registry release, on a host the foreign-host
+# check allows or with no host at all: a local folder or file (npm, yarn, pnpm and bun `file:`, `link:`,
+# `portal:` and `workspace:` specs, npm's `"link": true`, uv's path, editable, directory and virtual
+# sources, poetry's directory and file sources, Gemfile.lock's PATH section), or a git checkout or
+# repository tarball on GitHub (uv's git source, poetry's and pnpm's `type = git`, Gemfile.lock's GIT
+# section, codeload.github.com archives). The next install runs that code's build or install scripts.
+LOCK_SOURCE = re.compile(
+    r"""\b(?:file|link|portal|workspace):|"link"\s*:\s*true|\b(?:path|editable|directory|virtual|git)\s*=|"""
+    r"""\btype\s*[:=]\s*["']?(?:directory|file|git|url)\b|^\s*(?:PATH|GIT)\s*$|://(?:codeload\.)?github\.com/""", re.I)
+
+
+def lock_sources_added(repo_dir, base, path):
+    """Added lines of the lockfile `path` that name a source other than a registry release."""
+    diff = raw_diff(repo_dir, "origin/%s...HEAD" % base, "--", path)
+    return [l[1:] for l in diff_lines(diff)
+            if l.startswith("+") and not l.startswith("+++") and LOCK_SOURCE.search(l[1:])]
+
+
 def dependency_only(repo_dir, base, paths):
     """True when every changed file may merge without PR CI, on the strength of the agent's sandboxed
     before-and-after runs and the review: a lockfile (a requirements file without pip options), or a
@@ -1660,6 +1678,8 @@ def dependency_only(repo_dir, base, paths):
         if name in LOCKFILES and name not in CODE_LOCKFILES:
             if name == "requirements.txt" and (not plain_requirements(repo_dir, base, path)
                                                or pip_sources_changed(repo_dir, base, path)):
+                return False
+            if lock_sources_added(repo_dir, base, path):
                 return False
             continue
         if name not in MANIFEST_CHECKS:

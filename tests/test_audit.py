@@ -772,6 +772,38 @@ class DependencyOnly(Branch):
                 self.setUp()
                 self.assertFalse(self.check({name: "a\n"}, {name: "b\n"}))
 
+    def test_lockfile_sources_other_than_a_registry_release_need_ci(self):
+        npm = LOCK.replace("1.2.3", "1.2.4")
+        rows = [
+            ("package-lock.json", "registry bump", LOCK, npm, True),
+            ("package-lock.json", "local tarball", LOCK, npm.replace("https://registry.npmjs.org/x/-/x-1.2.4.tgz", "file:../x.tgz"), False),
+            ("package-lock.json", "linked folder", LOCK, npm.replace('"integrity": "sha512-aaa"', '"link": true'), False),
+            ("package-lock.json", "repository tarball", LOCK, npm.replace("https://registry.npmjs.org/x/-/x-1.2.4.tgz",
+                                                                          "https://codeload.github.com/e/x/tar.gz/abc"), False),
+            ("yarn.lock", "registry bump", 'x@^1:\n  version "1.2.3"\n  resolved "https://registry.yarnpkg.com/x/-/x-1.2.3.tgz"\n',
+             'x@^1:\n  version "1.2.4"\n  resolved "https://registry.yarnpkg.com/x/-/x-1.2.4.tgz"\n', True),
+            ("yarn.lock", "portal", 'x@^1:\n  version "1.2.3"\n', 'x@portal:../x:\n  version "1.2.4"\n', False),
+            ("pnpm-lock.yaml", "directory resolution", "packages:\n  x@1.2.3:\n    resolution: {integrity: sha512-a}\n",
+             "packages:\n  x@1.2.4:\n    resolution: {directory: ../x, type: directory}\n", False),
+            ("uv.lock", "registry bump", '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+             '[[package]]\nname = "x"\nversion = "1.1"\nsource = { registry = "https://pypi.org/simple" }\n', True),
+            ("uv.lock", "editable source", '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+             '[[package]]\nname = "x"\nversion = "1.1"\nsource = { editable = "../x" }\n', False),
+            ("uv.lock", "git source", '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+             '[[package]]\nname = "x"\nversion = "1.1"\nsource = { git = "https://github.com/e/x?rev=1#abc" }\n', False),
+            ("poetry.lock", "git source", '[[package]]\nname = "x"\nversion = "1.0"\n',
+             '[[package]]\nname = "x"\nversion = "1.1"\n\n[package.source]\ntype = "git"\nurl = "https://github.com/e/x.git"\n', False),
+            ("Gemfile.lock", "PATH section", "GEM\n  remote: https://rubygems.org/\n  specs:\n    x (1.0)\n",
+             "PATH\n  remote: ../x\n  specs:\n    x (1.1)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n", False),
+            ("Gemfile.lock", "GIT section", "GEM\n  remote: https://rubygems.org/\n  specs:\n    x (1.0)\n",
+             "GIT\n  remote: https://github.com/e/x.git\n  revision: abc\n  specs:\n    x (1.1)\n", False),
+        ]
+        for name, label, before, after, expect in rows:
+            with self.subTest("%s: %s" % (name, label)):
+                self.setUp()
+                # The seed repo already holds LOCK, and an unchanged file gives git nothing to commit.
+                self.assertEqual(self.check({name: before} if before != SEED.get(name) else None, {name: after}), expect)
+
     def test_a_new_manifest_does_not_qualify(self):
         self.assertFalse(self.check(None, {"sub/package.json": PACKAGE}))
 
