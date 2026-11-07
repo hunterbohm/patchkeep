@@ -1,6 +1,8 @@
-# vulnwatch
+# patchkeep
 
-vulnwatch finds vulnerable dependencies in your GitHub repos and fixes them on its own. A sandboxed coding agent makes the fix, a second model reviews it, and it merges once checks pass. No human is in the loop.
+patchkeep finds vulnerable dependencies in your GitHub repos and fixes them on its own. A sandboxed coding agent makes the fix, a second model reviews it, and it merges once checks pass. No human is in the loop.
+
+This project was called vulnwatch until November 2026. If you ran it under that name, move `~/.config/vulnwatch` to `~/.config/patchkeep` and `~/.local/state/vulnwatch` to `~/.local/state/patchkeep`, and point your cron line at `patchkeep.py`.
 
 Each pass takes a few minutes:
 
@@ -49,11 +51,11 @@ Known limits:
 ## Setup
 
 ```sh
-git clone https://github.com/hunterbohm/vulnwatch ~/vulnwatch
-mkdir -p ~/.config/vulnwatch
-cp ~/vulnwatch/config.example.toml ~/.config/vulnwatch/config.toml
+git clone https://github.com/hunterbohm/patchkeep ~/patchkeep
+mkdir -p ~/.config/patchkeep
+cp ~/patchkeep/config.example.toml ~/.config/patchkeep/config.toml
 # set github.owners, and notify.command if you want texts or Slack messages
-python3 ~/vulnwatch/vulnwatch.py --dry-run
+python3 ~/patchkeep/patchkeep.py --dry-run
 ```
 
 The dry run lists every finding and every fixer it would start. It changes nothing.
@@ -61,7 +63,7 @@ The dry run lists every finding and every fixer it would start. It changes nothi
 Then run it every 5 minutes. With cron:
 
 ```cron
-*/5 * * * * /usr/bin/env python3 $HOME/vulnwatch/vulnwatch.py >> $HOME/.local/state/vulnwatch/notify.log 2>&1
+*/5 * * * * /usr/bin/env python3 $HOME/patchkeep/patchkeep.py >> $HOME/.local/state/patchkeep/notify.log 2>&1
 ```
 
 The first pass records what already exists without notifying you, then starts fixers for repos that have findings, 2 at a time. After that, you hear only about new findings and outcomes.
@@ -80,7 +82,7 @@ The same hooks work for an agent app that can start threads from the command lin
 
 ## Machines
 
-vulnwatch covers code. For servers and laptops, set `hosts.on_kev_command` to your own patch script. It runs whenever CISA adds an actively exploited vulnerability, and the new ids are in `$VULNWATCH_NEW_KEV`.
+patchkeep covers code. For servers and laptops, set `hosts.on_kev_command` to your own patch script. It runs whenever CISA adds an actively exploited vulnerability, and the new ids are in `$PATCHKEEP_NEW_KEV`.
 
 ## Tests
 

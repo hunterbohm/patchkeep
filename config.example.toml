@@ -1,14 +1,14 @@
-# Copy to ~/.config/vulnwatch/config.toml (or point VULNWATCH_CONFIG at it).
+# Copy to ~/.config/patchkeep/config.toml (or point PATCHKEEP_CONFIG at it).
 
 # Must be under $HOME: the fixer's sandbox denies all of $HOME, which is what keeps the
 # trusted checkout and the kill switches out of the agent's reach.
-state_dir = "~/.local/state/vulnwatch"
+state_dir = "~/.local/state/patchkeep"
 
 # Where the agent's working copy lives. Must be outside $HOME and on the same filesystem as
-# state_dir. /tmp works on macOS; on Linux with a tmpfs /tmp, use a folder such as /var/tmp/vulnwatch.
+# state_dir. /tmp works on macOS; on Linux with a tmpfs /tmp, use a folder such as /var/tmp/patchkeep.
 work_root = "/tmp"
 
-# PATH for every command vulnwatch runs (gh, git, codex, rsync, your package managers).
+# PATH for every command patchkeep runs (gh, git, codex, rsync, your package managers).
 path = "/opt/homebrew/bin:/usr/local/bin:~/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 [github]
@@ -30,8 +30,8 @@ reviewer_model = "gpt-6.1-sol"
 reviewer_effort = "high"
 review_rounds = 3
 timeout_hours = 2
-git_name = "vulnwatch"
-git_email = "vulnwatch@users.noreply.github.com"
+git_name = "patchkeep"
+git_email = "patchkeep@users.noreply.github.com"
 
 # Optional: run each fix somewhere you can watch it. {fix_cmd} is the full fixer command,
 # already shell-quoted. Other fields: {repo} {name} {log} {results} {slug}.
@@ -53,6 +53,6 @@ command = ""
 
 [hosts]
 # Optional: run this when CISA adds new actively exploited vulnerabilities (via cve.now),
-# e.g. your own machine patch script. New ids are in $VULNWATCH_NEW_KEV.
+# e.g. your own machine patch script. New ids are in $PATCHKEEP_NEW_KEV.
 on_kev_command = ""
 min_gap_hours = 2

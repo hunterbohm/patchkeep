@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""vulnwatch: find vulnerable dependencies in your GitHub repos, fix them with a sandboxed
+"""patchkeep: find vulnerable dependencies in your GitHub repos, fix them with a sandboxed
 agent, get a second model to review the fix, and merge it. No human in the loop.
 
-  vulnwatch.py                       one watch pass (inventory, match, launch fixers, report)
-  vulnwatch.py --dry-run             one pass that prints what it would do; changes nothing
-  vulnwatch.py fix OWNER/REPO ITEMS  fixer for one repo (started by the watch pass)
+  patchkeep.py                       one watch pass (inventory, match, launch fixers, report)
+  patchkeep.py --dry-run             one pass that prints what it would do; changes nothing
+  patchkeep.py fix OWNER/REPO ITEMS  fixer for one repo (started by the watch pass)
 
 Run the watch pass every few minutes (cron, launchd, systemd). Its stdout is the
 notification text; empty stdout means nothing new. See README.md.
@@ -14,7 +14,7 @@ every read and write under $HOME, so it never sees GitHub or git credentials, an
 as hostile. This script commits locally, runs every check and the reviewer on that commit, and only
 then pushes, opens the PR, and merges the exact commit it pushed.
 
-Kill switches in the state dir (default ~/.local/state/vulnwatch):
+Kill switches in the state dir (default ~/.local/state/patchkeep):
   DISABLE_AUTOFIX    detect and notify only (also stops running fixers before push/merge)
   DISABLE_AUTOMERGE  fix and open PRs, never merge
 """
@@ -41,10 +41,10 @@ import urllib.request
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.environ.get("VULNWATCH_CONFIG", HOME + "/.config/vulnwatch/config.toml")
+CONFIG_PATH = os.environ.get("PATCHKEEP_CONFIG", HOME + "/.config/patchkeep/config.toml")
 
 DEFAULTS = {
-    "state_dir": "~/.local/state/vulnwatch",
+    "state_dir": "~/.local/state/patchkeep",
     "work_root": "/tmp",
     "path": "/opt/homebrew/bin:/usr/local/bin:~/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     "github": {"owners": [], "active_days": 120, "ignore": [], "include_forks": False},
@@ -53,7 +53,7 @@ DEFAULTS = {
         "author_model": "gpt-6-astra", "author_effort": "high",
         "reviewer_model": "gpt-6.1-sol", "reviewer_effort": "high",
         "review_rounds": 3, "timeout_hours": 2,
-        "git_name": "vulnwatch", "git_email": "vulnwatch@users.noreply.github.com",
+        "git_name": "patchkeep", "git_email": "patchkeep@users.noreply.github.com",
         "launch_command": "", "done_command": "",
     },
     "notify": {"command": ""},
@@ -170,7 +170,7 @@ def gh_json(path, paginate=False):
 
 
 def http(url, data=None, headers=None, timeout=60):
-    req = urllib.request.Request(url, data=data, headers=dict({"User-Agent": "vulnwatch"}, **(headers or {})))
+    req = urllib.request.Request(url, data=data, headers=dict({"User-Agent": "patchkeep"}, **(headers or {})))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
@@ -242,7 +242,7 @@ def fixer_alive(fx, repo):
     fixer may not have started yet. Every step inside a fixer has its own timeout, so a live
     process always ends on its own."""
     age = now() - fx.get("started", 0)
-    rc, so, _ = run(["pgrep", "-f", "vulnwatch.py fix %s " % repo], 10)
+    rc, so, _ = run(["pgrep", "-f", "patchkeep.py fix %s " % repo], 10)
     return (rc == 0 and so.strip() != "") or ("handle" in fx and age < 900)
 
 
@@ -293,7 +293,7 @@ def upload_lockfile(content, name):
 
 def full_tree(full_name, branch):
     """Blobless clone listing for repos too big for the trees API."""
-    d = tempfile.mkdtemp(prefix="vulnwatch-tree-", dir=WORK_ROOT)
+    d = tempfile.mkdtemp(prefix="patchkeep-tree-", dir=WORK_ROOT)
     try:
         must(["gh", "repo", "clone", full_name, d + "/r", "--", "--depth", "1", "--filter=blob:none",
               "--no-checkout", "--branch", branch], 600)
@@ -466,7 +466,7 @@ def maybe_run_kev_hook(state, dry, errors):
         return "would run on_kev_command for new KEV entries: " + ", ".join(new[:5])
     out = LOG_DIR + "/kev-hook-%s.out" % stamp()
     p = subprocess.Popen(cmd, shell=True, stdout=open(out, "w"), stderr=subprocess.STDOUT,
-                         start_new_session=True, env=env(VULNWATCH_NEW_KEV=",".join(new)))
+                         start_new_session=True, env=env(PATCHKEEP_NEW_KEV=",".join(new)))
     hook.update({"pid": p.pid, "started": now(), "out": out, "reported": False})
     state["kev_seen"] = sorted(seen | set(ids))[-3000:]
     log("on_kev_command started for new KEV %s" % new[:10])
@@ -528,7 +528,7 @@ def launch_fixer(repo, fs, fixes, state):
     with open(items_path, "w") as f:
         json.dump(fs, f, indent=1)
     logf = LOG_DIR + "/fix-%s-%s.log" % (slug(repo), stamp())
-    fix_cmd = " ".join(shlex.quote(a) for a in ["env", "VULNWATCH_CONFIG=" + os.path.abspath(CONFIG_PATH),
+    fix_cmd = " ".join(shlex.quote(a) for a in ["env", "PATCHKEEP_CONFIG=" + os.path.abspath(CONFIG_PATH),
                                                  sys.executable, os.path.abspath(__file__), "fix", repo, items_path])
     rec = {"state": "running", "started": now(), "set": set_hash(fs), "log": logf, "items": items_path}
     template = CFG["fix"]["launch_command"]
@@ -631,7 +631,7 @@ def watch(dry=False):
     if problem:
         autofix = False
         if state.get("dir_problem") != problem:
-            texts.append("vulnwatch is not fixing anything: " + problem)
+            texts.append("patchkeep is not fixing anything: " + problem)
         state["dir_problem"] = problem
     else:
         state.pop("dir_problem", None)
@@ -706,7 +706,7 @@ def watch(dry=False):
         state["health_alerted"] = False
     if state["fail_streak"] >= 12 and not state.get("health_alerted"):
         state["health_alerted"] = True
-        texts.append("vulnwatch has had errors for an hour: %s" % errors[0][:160])
+        texts.append("patchkeep has had errors for an hour: %s" % errors[0][:160])
 
     state["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
     if dry:
@@ -890,7 +890,7 @@ def reduce_diff(diff):
 
 def sol_review(body, diff, history):
     prompt = "%s\n\nPR description:\n%s\n\n%sDiff:\n%s" % (REVIEW_ASK, body, history, diff)
-    rdir = tempfile.mkdtemp(prefix="vulnwatch-review-", dir=WORK_ROOT)
+    rdir = tempfile.mkdtemp(prefix="patchkeep-review-", dir=WORK_ROOT)
     out = rdir + "/verdict.txt"
     try:
         rc, so, se = run(["codex", "exec", "-m", CFG["fix"]["reviewer_model"], "-c", "model_reasoning_effort=" + CFG["fix"]["reviewer_effort"], "-s", "read-only",
@@ -1299,7 +1299,7 @@ def close_stale_auto_prs(repo):
     for p in json.loads(so or "[]") if rc == 0 else []:
         if p["headRefName"].startswith("security/auto-"):
             run(["gh", "pr", "close", str(p["number"]), "-R", repo, "--delete-branch",
-                 "--comment", "Superseded by a newer vulnwatch run."], 60)
+                 "--comment", "Superseded by a newer patchkeep run."], 60)
 
 
 def commit_local(trusted, title):
@@ -1355,7 +1355,7 @@ def revert_if_main_breaks(repo, pr, trusted, base, short, url):
     git(trusted, "push", "-q", "-u", "origin", rbranch, timeout=600)
     rsha = git(trusted, "rev-parse", "HEAD").strip()
     body = ("## Why\nThe security fix in %s broke checks on %s after merging, so this restores the previous "
-            "state. vulnwatch will retry the fix.\n\nAutomated by vulnwatch." % (url, base))
+            "state. patchkeep will retry the fix.\n\nAutomated by patchkeep." % (url, base))
     rurl = must(["gh", "pr", "create", "-R", repo, "--base", base, "--head", rbranch,
                  "--title", "Revert security fix that broke %s" % base, "--body", body], 120, trusted).strip()
     rpr = int(rurl.rstrip("/").rsplit("/", 1)[-1])
@@ -1663,7 +1663,7 @@ def merge_blockers(checks, dep_only):
 def fix(repo, items_path):
     problem = dir_problem()
     if problem:
-        raise SystemExit("vulnwatch fix: " + problem)
+        raise SystemExit("patchkeep fix: " + problem)
     lock = open(STATE_DIR + "/fix-%s.lock" % slug(repo), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1676,7 +1676,7 @@ def fix(repo, items_path):
     short = repo.split("/", 1)[1]
     # Resolved once: every later path under the work folder is built from this one, and the folder is told
     # apart from a look-alike by its device and inode, not by its name.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="vulnwatch-%s-" % short, dir=WORK_ROOT))
+    work = os.path.realpath(tempfile.mkdtemp(prefix="patchkeep-%s-" % short, dir=WORK_ROOT))
     # Kept for the whole run: what the trusted side does inside the folder goes through this handle, which
     # a link put at the path later cannot redirect.
     work_fd = os.open(work, OPEN_DIR)
@@ -1744,7 +1744,7 @@ def fix(repo, items_path):
             if foreign:
                 refuse("it pulls packages from unexpected hosts (%s)" % ", ".join(foreign[:3]))
                 return
-            body = (res.get("pr_body") or "") + "\n\nAutomated by vulnwatch."
+            body = (res.get("pr_body") or "") + "\n\nAutomated by patchkeep."
             agree, verdict = sol_review(body, diff, history)
             log("%s review round %d on %s: %s" % (repo, rnd, sha[:10], "AGREE" if agree else "findings"))
             if agree or rnd == REVIEW_ROUNDS:

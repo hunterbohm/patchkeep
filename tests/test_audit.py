@@ -20,9 +20,9 @@ from unittest import mock
 
 _STATE = tempfile.mkdtemp(prefix="vwaudit-state-")
 atexit.register(shutil.rmtree, _STATE, ignore_errors=True)
-os.environ["VULNWATCH_CONFIG"] = os.path.join(_STATE, "missing.toml")
+os.environ["PATCHKEEP_CONFIG"] = os.path.join(_STATE, "missing.toml")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import vulnwatch as V  # noqa: E402
+import patchkeep as V  # noqa: E402
 
 LOCK = json.dumps({"name": "app", "lockfileVersion": 3, "packages": {
     "": {"name": "app", "dependencies": {"x": "^1.2.0"}},
