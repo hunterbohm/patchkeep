@@ -1696,7 +1696,10 @@ def npm_lock(text):
     packages = doc.get("packages", {}) if isinstance(doc, dict) else None
     if not isinstance(packages, dict):
         raise ValueError("not a package lock")
-    out = {("packages", k): [v] for k, v in packages.items()}
+    # How npm reads the file depends on its version and on which of these sections it has.
+    out = {("shape", ""): [{"lockfileVersion": doc.get("lockfileVersion"),
+                            "sections": [s for s in ("packages", "dependencies") if s in doc]}]}
+    out.update((("packages", k), [v]) for k, v in packages.items())
     stack = [("node_modules/", doc.get("dependencies", {}))]
     while stack:
         prefix, deps = stack.pop()
@@ -1718,25 +1721,36 @@ def npm_source(entry):
     return {k: v for k, v in entry.items() if k not in NPM_RANGE_KEYS} if isinstance(entry, dict) else entry
 
 
-# The dependency lists npm installs from (peers are left out: lockfiles made with --legacy-peer-deps lack them).
-NPM_NEEDS = ("dependencies", "optionalDependencies", "devDependencies", "requires")
+# The dependency maps of a lock entry (a v1 entry lists its ranges under `requires`). npm installs what they
+# name; only peers may be missing from the lock (lockfiles made with --legacy-peer-deps lack them).
+NPM_NEEDS = {"packages": ("dependencies", "optionalDependencies", "devDependencies", "peerDependencies"),
+             "dependencies": ("requires",)}
 
 
-def npm_complete(key, entry, lock):
-    """True when every dependency the entry lists is in the lock where npm looks for it: the entry's own
+def npm_complete(old, new):
+    """True when the lock still holds everything npm installs from. No key of the base is gone, the file's
+    shape included (it decides how npm reads the file). In a new or changed entry, a dependency spec that
+    changed is a registry spec, and every dependency but a peer is where npm looks for it: the entry's own
     node_modules, then each parent's, up to the top."""
-    section, path = key
-    for field in NPM_NEEDS:
-        deps = entry.get(field, {}) if isinstance(entry, dict) else None
-        if not isinstance(deps, dict):
-            return False
-        for name in deps:
-            at = path
-            while (section, (at + "/" if at else "") + "node_modules/" + name) not in lock:
-                if not at:
+    if not set(old) <= set(new):
+        return False
+    for (section, path), entries in new.items():
+        before = old.get((section, path), [])
+        prior = before[0] if len(before) == 1 and isinstance(before[0], dict) else {}
+        for entry in entries:
+            if any(same(entry, b) for b in before):
+                continue
+            for field in NPM_NEEDS.get(section, ()):
+                deps = entry.get(field, {}) if isinstance(entry, dict) else None
+                if not isinstance(deps, dict) or not registry_specs_only(prior.get(field), deps):
                     return False
-                cut = at.rfind("/node_modules/")
-                at = at[:cut] if cut >= 0 else ""
+                for dep in ([] if field == "peerDependencies" else deps):
+                    at = path
+                    while (section, (at + "/" if at else "") + "node_modules/" + dep) not in new:
+                        if not at:
+                            return False
+                        cut = at.rfind("/node_modules/")
+                        at = at[:cut] if cut >= 0 else ""
     return True
 
 
@@ -1745,26 +1759,55 @@ def canon(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def uv_complete(key, p, lock):
-    names, groups = {canon(n) for n in lock}, [p.get("dependencies", [])]
+def toml_complete(needs):
+    """The completeness check for a uv.lock, poetry.lock or Cargo.lock: no name has fewer packages than in
+    the base, and every dependency of every package is one of its packages, matched by name and, where the
+    lock gives them, by version and source. `needs(package)` lists (name, version, source) per dependency."""
+    def check(old, new):
+        if any(len(new.get(name, [])) < len(packages) for name, packages in old.items()):
+            return False
+        held = {}
+        for packages in new.values():
+            for p in packages:
+                held.setdefault(canon(p["name"]), []).append(p)
+        return all(any((version is None or same(q.get("version"), version))
+                       and (source is None or same(q.get("source"), source)) for q in held.get(canon(name), []))
+                   for packages in new.values() for p in packages for name, version, source in needs(p))
+    return check
+
+
+def uv_needs(p):
+    groups = [p.get("dependencies", [])]
     for field in ("optional-dependencies", "dev-dependencies"):
         extra = p.get(field, {})
         if not isinstance(extra, dict):
-            return False
+            raise ValueError(field)
         groups += list(extra.values())
-    return all(isinstance(deps, list) and all(isinstance(d, dict) and isinstance(d.get("name"), str)
-                                              and canon(d["name"]) in names for d in deps) for deps in groups)
+    if not all(isinstance(deps, list) and all(isinstance(d, dict) and isinstance(d.get("name"), str) for d in deps)
+               for deps in groups):
+        raise ValueError("dependencies")
+    return [(d["name"], d.get("version"), d.get("source")) for deps in groups for d in deps]
 
 
-def poetry_complete(key, p, lock):
-    names, deps = {canon(n) for n in lock}, p.get("dependencies", {})
-    return isinstance(deps, dict) and all(canon(n) in names for n, spec in deps.items()
-                                          if not (isinstance(spec, dict) and spec.get("optional") is True))
+def poetry_needs(p):
+    deps = p.get("dependencies", {})
+    if not isinstance(deps, dict):
+        raise ValueError("dependencies")
+    return [(n, None, None) for n, spec in deps.items() if not (isinstance(spec, dict) and spec.get("optional") is True)]
 
 
-def cargo_complete(key, p, lock):
+def cargo_needs(p):
+    """Cargo writes a dependency as `name`, adding ` version` and ` (source)` when the name alone is ambiguous."""
     deps = p.get("dependencies", [])
-    return isinstance(deps, list) and all(isinstance(d, str) and d.split(" ", 1)[0] in lock for d in deps)
+    if not isinstance(deps, list):
+        raise ValueError("dependencies")
+    out = []
+    for d in deps:
+        m = re.fullmatch(r"(\S+)(?: (\S+))?(?: \((\S+)\))?", d) if isinstance(d, str) else None
+        if not m:
+            raise ValueError("dependency")
+        out.append(m.groups())
+    return out
 
 
 def toml_packages(text):
@@ -1791,9 +1834,11 @@ def uv_registry(p):
 LOCK_READERS = {
     "package-lock.json": (npm_lock, npm_registry, npm_source, npm_complete),
     "npm-shrinkwrap.json": (npm_lock, npm_registry, npm_source, npm_complete),
-    "uv.lock": (toml_packages, uv_registry, lambda p: [p.get(k) for k in ("source", "sdist", "wheels")], uv_complete),
-    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source"), poetry_complete),
-    "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source"), cargo_complete),
+    "uv.lock": (toml_packages, uv_registry, lambda p: [p.get(k) for k in ("source", "sdist", "wheels")],
+                toml_complete(uv_needs)),
+    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source"), toml_complete(poetry_needs)),
+    "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source"),
+                   toml_complete(cargo_needs)),
 }
 
 
@@ -1801,10 +1846,10 @@ def lock_ok(name, old_text, new_text):
     """True when the lockfile `name` may merge without CI, from its text in the base (None when it is new)
     and on the branch (None when it is deleted). Every package in it is a registry release, or installs from
     the same place as a package under the same key in the base (for uv, its files as well as its source).
-    And it still holds everything an install needs: no key of the base is gone, and every dependency a new
-    or changed package lists is in it. An install resolves anything missing afresh, past the lockfile's
-    checks, the same way it would with the lockfile deleted. Whether a locked version is inside the range
-    asked for is left to the release-age rule and the review: that takes each tool's own resolver."""
+    And it still holds everything an install needs (npm_complete, toml_complete): an install resolves anything
+    missing afresh, past these checks, the same way it would with the lockfile deleted. Whether a locked
+    version is inside the range asked for is left to the release-age rule and the review: that takes each
+    tool's own resolver."""
     if name == "go.sum":
         return True
     if name not in LOCK_READERS or new_text is None:
@@ -1812,16 +1857,12 @@ def lock_ok(name, old_text, new_text):
     read, registry, source, complete = LOCK_READERS[name]
     try:
         old, new = read(old_text) if old_text is not None else {}, read(new_text)
-        if not set(old) <= set(new):
+        if not complete(old, new):
             return False
         for key, packages in new.items():
             before = old.get(key, [])
             for p in packages:
-                if any(same(p, b) for b in before):
-                    continue
                 if not registry(p) and not any(same(source(p), source(b)) for b in before):
-                    return False
-                if not complete(key, p, new):
                     return False
     except (ValueError, TypeError, AttributeError, RecursionError):
         return False

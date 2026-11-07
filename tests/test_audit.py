@@ -796,6 +796,15 @@ class DependencyOnly(Branch):
         has_z["packages"]["node_modules/z"] = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/z/-/z-1.0.0.tgz"}
         dropped, needs_z, has_z = (json.dumps(d, indent=2) + "\n" for d in (dropped, needs_z, has_z))
         npm_base = npm.replace("1.2.4", "1.2.3")
+        git_spec = json.loads(has_z)
+        git_spec["packages"]["node_modules/x"]["dependencies"] = {"z": "github:e/z"}
+        git_spec = json.dumps(git_spec, indent=2) + "\n"
+        v1_base = v1({"version": "1.2.3", "resolved": tarball.replace("4", "3")})
+        v1_packages = dict(json.loads(v1_base), packages={})
+        v1_packages = json.dumps(v1_packages) + "\n"
+        two_x = ('[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["x 1.0.0 (registry+https://github.com/rust-lang/'
+                 'crates.io-index)", "x 0.9.0 (git+https://github.com/e/x#abc)"]\n\n')
+        pinned = '[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["x 1.0.0"]\n\n'
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -830,6 +839,12 @@ class DependencyOnly(Branch):
              poetry("1.1", '\n[package.dependencies]\nZ-Pkg = ">=1"\n') + '\n[[package]]\nname = "z-pkg"\nversion = "1.0"\n', True),
             ("Cargo.lock", "a new dependency missing from the lock", cargo("1.0.0"), cargo("1.0.1", crates + 'dependencies = ["z"]\n'), False),
             ("Cargo.lock", "a crate dropped", member + cargo("1.0.0"), member.replace('dependencies = ["x"]\n', ""), False),
+            ("package-lock.json", "a dependency spec turned into a git source", has_z, git_spec, False),
+            ("package-lock.json", "a v1 lockfile given an empty packages map", v1_base, v1_packages, False),
+            ("Cargo.lock", "one of two same-named crates dropped",
+             two_x + cargo("1.0.0") + "\n" + cargo("0.9.0", 'source = "git+https://github.com/e/x#abc"\n'), two_x + cargo("1.0.0"), False),
+            ("Cargo.lock", "a dependency on a version no longer held", pinned + cargo("1.0.0"), pinned + cargo("1.0.1"), False),
+            ("uv.lock", "one of two same-named packages dropped", uv("1.0", reg) + "\n" + uv("2.0", reg), uv("2.0", reg), False),
             ("uv.lock", "registry bump", uv("1.0", reg), uv("1.1", reg, 'sdist = { url = "https://files.pythonhosted.org/x-1.1.tar.gz", '
                                                                       'hash = "sha256:a", size = 1 }\n'), True),
             ("uv.lock", "editable source", uv("1.0", reg), uv("1.1", '{ editable = "../x" }'), False),
