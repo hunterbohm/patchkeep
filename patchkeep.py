@@ -1759,19 +1759,25 @@ def canon(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def toml_complete(needs):
+def toml_complete(needs, key=canon, specs=None):
     """The completeness check for a uv.lock, poetry.lock or Cargo.lock: no name has fewer packages than in
-    the base, and every dependency of every package is one of its packages, matched by name and, where the
-    lock gives them, by version and source. `needs(package)` lists (name, version, source) per dependency."""
+    the base, and every dependency of every package is one of its packages, matched by name (as `key`
+    compares names in that ecosystem) and, where the lock gives them, by version and source.
+    `needs(package)` lists (name, version, source) per dependency. A lock that names dependencies without
+    their source also passes `specs(old, new)` over the dependency entries of each new or changed package."""
     def check(old, new):
         if any(len(new.get(name, [])) < len(packages) for name, packages in old.items()):
             return False
         held = {}
-        for packages in new.values():
+        for name, packages in new.items():
+            before = old.get(name, [])
+            prior = before[0].get("dependencies") if len(before) == 1 else None
             for p in packages:
-                held.setdefault(canon(p["name"]), []).append(p)
+                held.setdefault(key(p["name"]), []).append(p)
+                if specs and not any(same(p, b) for b in before) and not specs(prior, p.get("dependencies", {})):
+                    return False
         return all(any((version is None or same(q.get("version"), version))
-                       and (source is None or same(q.get("source"), source)) for q in held.get(canon(name), []))
+                       and (source is None or same(q.get("source"), source)) for q in held.get(key(name), []))
                    for packages in new.values() for p in packages for name, version, source in needs(p))
     return check
 
@@ -1836,9 +1842,12 @@ LOCK_READERS = {
     "npm-shrinkwrap.json": (npm_lock, npm_registry, npm_source, npm_complete),
     "uv.lock": (toml_packages, uv_registry, lambda p: [p.get(k) for k in ("source", "sdist", "wheels")],
                 toml_complete(uv_needs)),
-    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source"), toml_complete(poetry_needs)),
+    # poetry.lock names a dependency without its source, so a changed entry must be a plain version
+    # requirement, not a path, URL or git table. Cargo tells `foo-bar` from `foo_bar`.
+    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source"),
+                    toml_complete(poetry_needs, specs=poetry_entries_ok)),
     "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source"),
-                   toml_complete(cargo_needs)),
+                   toml_complete(cargo_needs, key=lambda name: name)),
 }
 
 

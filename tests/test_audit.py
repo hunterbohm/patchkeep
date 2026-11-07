@@ -805,6 +805,9 @@ class DependencyOnly(Branch):
         two_x = ('[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["x 1.0.0 (registry+https://github.com/rust-lang/'
                  'crates.io-index)", "x 0.9.0 (git+https://github.com/e/x#abc)"]\n\n')
         pinned = '[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["x 1.0.0"]\n\n'
+        zdep = lambda version, spec: poetry(version, '\n[package.dependencies]\nz = %s\n' % spec) + '\n[[package]]\nname = "z"\nversion = "1.0"\n'
+        crate = lambda name, version: '[[package]]\nname = "%s"\nversion = "%s"\n%s\n' % (name, version, crates)
+        needs_fb = '[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["foo-bar 1.0.0"]\n\n'
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -845,6 +848,11 @@ class DependencyOnly(Branch):
              two_x + cargo("1.0.0") + "\n" + cargo("0.9.0", 'source = "git+https://github.com/e/x#abc"\n'), two_x + cargo("1.0.0"), False),
             ("Cargo.lock", "a dependency on a version no longer held", pinned + cargo("1.0.0"), pinned + cargo("1.0.1"), False),
             ("uv.lock", "one of two same-named packages dropped", uv("1.0", reg) + "\n" + uv("2.0", reg), uv("2.0", reg), False),
+            ("poetry.lock", "a dependency turned into a local path", zdep("1.0", '">=1"'), zdep("1.1", '{path = "../z"}'), False),
+            ("poetry.lock", "a dependency range and marker changed", zdep("1.0", '">=1"'),
+             zdep("1.1", '{version = ">=1.1", markers = "python_version >= \'3.9\'"}'), True),
+            ("Cargo.lock", "a dependency matched only by a look-alike name",
+             needs_fb + crate("foo-bar", "1.0.0") + crate("foo_bar", "1.0.0"), needs_fb + crate("foo-bar", "1.0.1") + crate("foo_bar", "1.0.0"), False),
             ("uv.lock", "registry bump", uv("1.0", reg), uv("1.1", reg, 'sdist = { url = "https://files.pythonhosted.org/x-1.1.tar.gz", '
                                                                       'hash = "sha256:a", size = 1 }\n'), True),
             ("uv.lock", "editable source", uv("1.0", reg), uv("1.1", '{ editable = "../x" }'), False),
