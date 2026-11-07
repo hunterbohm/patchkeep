@@ -33,7 +33,7 @@ The agent that writes the fix is treated as untrusted. Repo files, package metad
 Known limits:
 
 - In repos whose CI runs only on pushes to the default branch, a fix that changes only dependency entries and lockfiles merges on the agent's sandboxed before-and-after results plus the review. The post-merge revert is the backstop.
-- A fix that needs a change under `.github/` is refused before the push, and an hostile process that starts a session of its own can outlive its round, so the checks on the copy don't rely on the kill alone.
+- A fix that needs a change under `.github/` is refused before the push, and a hostile process that starts a session of its own can outlive its round, so the checks on the copy don't rely on the kill alone.
 - Browser tests (Playwright, Chromium) can't launch inside the Codex sandbox on macOS. Fixes in those repos tend to end as "couldn't fix" rather than merge.
 - Forks are skipped by default because their dependencies usually track upstream.
 - cve.now keeps each uploaded lockfile's package names and versions so it can serve that repo's feed. The lockfile file itself is deleted after parsing.
