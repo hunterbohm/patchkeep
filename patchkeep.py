@@ -1612,9 +1612,11 @@ ARCHIVE_NAME = re.compile(r"\.(?:zip|whl|tar|tgz|tbz2?|txz|tlz|tar\.gz|tar\.bz2|
 
 
 def plain_requirement(line):
-    """True for a requirements line that pip can only resolve from the package index."""
-    m = PIP_PLAIN.fullmatch(line)
-    return bool(m) and not ARCHIVE_NAME.search(m.group("name")) and not PIP_SOURCE.search(line)
+    """True for a requirements line that pip can only resolve from the package index. pip reads the
+    part before the marker, extras removed, as a local archive whenever it ends like one, version
+    specifiers included (`evil==1.0.tar.gz`), so the whole of that part is checked."""
+    target = re.sub(r"\[[^\]]*\]$", "", line.split(";", 1)[0].strip()).strip()
+    return bool(PIP_PLAIN.fullmatch(line)) and not ARCHIVE_NAME.search(target) and not PIP_SOURCE.search(line)
 
 
 def pip_logical_lines(text):

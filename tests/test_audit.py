@@ -809,6 +809,9 @@ class DependencyOnly(Branch):
             ("a wheel by file name", "x==1.0\n", "x==1.0\nevil-1.0-py3-none-any.whl\n", False),
             ("a name pip cannot read as a package", "x==1.0\n", "x==1.0\n_evil\n", False),
             ("an archive name holding --hash text", "x==1.0\n", "x==1.0\nevil--hash=.tar.gz\n", False),
+            ("an archive suffix after a version", "x==1.0\n", "x==1.0\nevil==1.0.tar.gz\n", False),
+            ("an archive suffix before extras", "x==1.0\n", "x==1.0\nevil==1.0.ZIP[a]\n", False),
+            ("an archive suffix before a marker", "x==1.0\n", 'x==1.0\nevil>=1.whl ; python_version > "3"\n', False),
             ("a hash option on the same line", "x==1.0 --hash=sha256:aa\n", "x==1.1 --hash=sha256:bb\n", True),
         ])
 
