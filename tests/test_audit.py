@@ -788,6 +788,14 @@ class DependencyOnly(Branch):
         npm_script = json.loads(npm)
         npm_script["packages"]["node_modules/x"]["scripts"] = {"preinstall": "evil"}
         npm_script = json.dumps(npm_script, indent=2) + "\n"
+        dropped = json.loads(npm)
+        del dropped["packages"]["node_modules/x"]
+        needs_z = json.loads(npm)
+        needs_z["packages"]["node_modules/x"]["dependencies"] = {"z": "^1"}
+        has_z = json.loads(json.dumps(needs_z))
+        has_z["packages"]["node_modules/z"] = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/z/-/z-1.0.0.tgz"}
+        dropped, needs_z, has_z = (json.dumps(d, indent=2) + "\n" for d in (dropped, needs_z, has_z))
+        npm_base = npm.replace("1.2.4", "1.2.3")
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -811,6 +819,17 @@ class DependencyOnly(Branch):
             ("package-lock.json", "an install script on a registry entry", npm.replace("1.2.4", "1.2.3"), npm_script, False),
             ("package-lock.json", "an install script on a kept workspace entry", ws, ws_script, False),
             ("package-lock.json", "deleted", LOCK, None, False),
+            ("package-lock.json", "emptied", npm_base, "{}\n", False),
+            ("package-lock.json", "a package dropped", npm_base, dropped, False),
+            ("package-lock.json", "a new dependency missing from the lock", npm_base, needs_z, False),
+            ("package-lock.json", "a new dependency in the lock", npm_base, has_z, True),
+            ("uv.lock", "a package dropped", app + "\n" + uv("1.0", reg), app, False),
+            ("uv.lock", "a new dependency missing from the lock", uv("1.0", reg), uv("1.1", reg, 'dependencies = [{ name = "z" }]\n'), False),
+            ("poetry.lock", "a new dependency missing from the lock", poetry("1.0"), poetry("1.1", '\n[package.dependencies]\nZ-Pkg = ">=1"\n'), False),
+            ("poetry.lock", "a new dependency in the lock", poetry("1.0"),
+             poetry("1.1", '\n[package.dependencies]\nZ-Pkg = ">=1"\n') + '\n[[package]]\nname = "z-pkg"\nversion = "1.0"\n', True),
+            ("Cargo.lock", "a new dependency missing from the lock", cargo("1.0.0"), cargo("1.0.1", crates + 'dependencies = ["z"]\n'), False),
+            ("Cargo.lock", "a crate dropped", member + cargo("1.0.0"), member.replace('dependencies = ["x"]\n', ""), False),
             ("uv.lock", "registry bump", uv("1.0", reg), uv("1.1", reg, 'sdist = { url = "https://files.pythonhosted.org/x-1.1.tar.gz", '
                                                                       'hash = "sha256:a", size = 1 }\n'), True),
             ("uv.lock", "editable source", uv("1.0", reg), uv("1.1", '{ editable = "../x" }'), False),
@@ -871,6 +890,8 @@ class DependencyOnly(Branch):
              "--index-url https://a.example \\\nx==1.0\n", False),
             ("a source line that was already there and stays", "--index-url https://a.example\nx==1.0\n",
              "--index-url https://a.example\nx==1.1\n", True),
+            ("index urls swapped (pip takes the last)", "--index-url https://a.example\n--index-url https://b.example\nx==1.0\n",
+             "--index-url https://b.example\n--index-url https://a.example\nx==1.0\n", False),
             ("a pin bump with env marker", 'x==1.0 ; python_version >= "3.9"\n', 'x==1.1 ; python_version >= "3.9"\n', True),
             ("extras and a range", "x[a,b]>=1.0,<2\n", "x[a,b]>=1.1,<2\n", True),
             ("the project itself", "x==1.0\n", "x==1.0\n.\n", False),
@@ -932,6 +953,9 @@ class DependencyOnly(Branch):
             ("tool table changed", base, toml(extra='[tool.hatch.build]\nhooks = "evil"\n'), False),
             ("invalid toml", base, "[", False),
             ("a true turned into 1", toml(extra="[tool.x]\na = true\n"), toml(extra="[tool.x]\na = 1\n"), False),
+            ("a date turned into a string", toml(extra="[tool.x]\na = 1979-05-27\n"), toml(extra='[tool.x]\na = "1979-05-27"\n'), False),
+            ("a date turned into a string naming its type", toml(extra="[tool.x]\na = 1979-05-27\n"),
+             toml(extra='[tool.x]\na = "date:datetime.date(1979, 5, 27)"\n'), False),
         ])
 
     def test_go_mod(self):

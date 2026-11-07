@@ -1409,7 +1409,17 @@ def same(a, b):
 
 
 def canonical_json(value):
-    return json.dumps(value, sort_keys=True, default=lambda v: "%s:%r" % (type(v).__name__, v))
+    """JSON in which every value carries its type, so two different values (a date and a string that reads
+    like one, false and 0) never come out the same."""
+    return json.dumps(typed(value), sort_keys=True)
+
+
+def typed(value):
+    if isinstance(value, dict):
+        return {"dict": {repr(k): typed(v) for k, v in value.items()}}
+    if isinstance(value, list):
+        return {"list": [typed(v) for v in value]}
+    return {type(value).__name__: repr(value)}
 
 
 def registry_specs_only(old, new):
@@ -1637,12 +1647,13 @@ def pip_logical_lines(text):
 
 def pip_sources_changed(repo_dir, base, path):
     """True when the requirement lines that are pip options or name a source other than the index differ
-    between the base and the branch. Whole logical lines are compared, not diff lines: a trailing backslash
+    between the base and the branch, order included (pip takes the last `--index-url`). Whole logical
+    lines are compared, not diff lines: a trailing backslash
     joins the next line, so a changed line can alter an unchanged one. `--hash` pins on their own
     continuation lines are not sources."""
     def risky(rev):
         text = blob(repo_dir, rev, path)
-        return None if text is None else sorted(l for l in pip_logical_lines(text) if l and not plain_requirement(l))
+        return None if text is None else [l for l in pip_logical_lines(text) if l and not plain_requirement(l)]
     old, new = risky("origin/" + base), risky("HEAD")
     return new is None or (old or []) != new
 
@@ -1707,6 +1718,55 @@ def npm_source(entry):
     return {k: v for k, v in entry.items() if k not in NPM_RANGE_KEYS} if isinstance(entry, dict) else entry
 
 
+# The dependency lists npm installs from (peers are left out: lockfiles made with --legacy-peer-deps lack them).
+NPM_NEEDS = ("dependencies", "optionalDependencies", "devDependencies", "requires")
+
+
+def npm_complete(key, entry, lock):
+    """True when every dependency the entry lists is in the lock where npm looks for it: the entry's own
+    node_modules, then each parent's, up to the top."""
+    section, path = key
+    for field in NPM_NEEDS:
+        deps = entry.get(field, {}) if isinstance(entry, dict) else None
+        if not isinstance(deps, dict):
+            return False
+        for name in deps:
+            at = path
+            while (section, (at + "/" if at else "") + "node_modules/" + name) not in lock:
+                if not at:
+                    return False
+                cut = at.rfind("/node_modules/")
+                at = at[:cut] if cut >= 0 else ""
+    return True
+
+
+def canon(name):
+    """A Python package name the way PyPI compares them."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def uv_complete(key, p, lock):
+    names, groups = {canon(n) for n in lock}, [p.get("dependencies", [])]
+    for field in ("optional-dependencies", "dev-dependencies"):
+        extra = p.get(field, {})
+        if not isinstance(extra, dict):
+            return False
+        groups += list(extra.values())
+    return all(isinstance(deps, list) and all(isinstance(d, dict) and isinstance(d.get("name"), str)
+                                              and canon(d["name"]) in names for d in deps) for deps in groups)
+
+
+def poetry_complete(key, p, lock):
+    names, deps = {canon(n) for n in lock}, p.get("dependencies", {})
+    return isinstance(deps, dict) and all(canon(n) in names for n, spec in deps.items()
+                                          if not (isinstance(spec, dict) and spec.get("optional") is True))
+
+
+def cargo_complete(key, p, lock):
+    deps = p.get("dependencies", [])
+    return isinstance(deps, list) and all(isinstance(d, str) and d.split(" ", 1)[0] in lock for d in deps)
+
+
 def toml_packages(text):
     """{name: [package]} for the `[[package]]` tables of a uv.lock, poetry.lock or Cargo.lock."""
     packages = tomllib.loads(text).get("package", [])
@@ -1729,29 +1789,39 @@ def uv_registry(p):
 
 
 LOCK_READERS = {
-    "package-lock.json": (npm_lock, npm_registry, npm_source),
-    "npm-shrinkwrap.json": (npm_lock, npm_registry, npm_source),
-    "uv.lock": (toml_packages, uv_registry, lambda p: [p.get(k) for k in ("source", "sdist", "wheels")]),
-    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source")),
-    "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source")),
+    "package-lock.json": (npm_lock, npm_registry, npm_source, npm_complete),
+    "npm-shrinkwrap.json": (npm_lock, npm_registry, npm_source, npm_complete),
+    "uv.lock": (toml_packages, uv_registry, lambda p: [p.get(k) for k in ("source", "sdist", "wheels")], uv_complete),
+    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source"), poetry_complete),
+    "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source"), cargo_complete),
 }
 
 
 def lock_ok(name, old_text, new_text):
     """True when the lockfile `name` may merge without CI, from its text in the base (None when it is new)
-    and on the branch (None when it is deleted): every package in it is a registry release, or installs from
-    the same place as a package under the same key in the base (for uv, its files as well as its source)."""
+    and on the branch (None when it is deleted). Every package in it is a registry release, or installs from
+    the same place as a package under the same key in the base (for uv, its files as well as its source).
+    And it still holds everything an install needs: no key of the base is gone, and every dependency a new
+    or changed package lists is in it. An install resolves anything missing afresh, past the lockfile's
+    checks, the same way it would with the lockfile deleted. Whether a locked version is inside the range
+    asked for is left to the release-age rule and the review: that takes each tool's own resolver."""
     if name == "go.sum":
         return True
     if name not in LOCK_READERS or new_text is None:
         return False
-    read, registry, source = LOCK_READERS[name]
+    read, registry, source, complete = LOCK_READERS[name]
     try:
         old, new = read(old_text) if old_text is not None else {}, read(new_text)
+        if not set(old) <= set(new):
+            return False
         for key, packages in new.items():
-            before = [source(p) for p in old.get(key, [])]
+            before = old.get(key, [])
             for p in packages:
-                if not registry(p) and not any(same(source(p), b) for b in before):
+                if any(same(p, b) for b in before):
+                    continue
+                if not registry(p) and not any(same(source(p), source(b)) for b in before):
+                    return False
+                if not complete(key, p, new):
                     return False
     except (ValueError, TypeError, AttributeError, RecursionError):
         return False
