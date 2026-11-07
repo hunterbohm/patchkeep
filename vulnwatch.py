@@ -27,11 +27,13 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -819,22 +821,100 @@ def sol_review(body, diff, history):
     return first == "AGREE", verdict
 
 
-SYNC_EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", ".pnpm-store/", ".next/",
-                 ".turbo/", ".cache/", ".parcel-cache/", ".pytest_cache/", ".mypy_cache/", "target/"]
+# Matches a file or folder of any case at any depth, with no trailing slash. rsync's `.git/` matches a
+# folder spelled exactly that way, but on a case-insensitive disk (macOS) a writer-made `.GIT/config`
+# lands in the trusted `.git/config`, and a `.git` file (`gitdir: ...`) is not a folder at all.
+GIT_EXCLUDE = "[.][Gg][Ii][Tt]"
+DIR_EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".pnpm-store/", ".next/",
+                ".turbo/", ".cache/", ".parcel-cache/", ".pytest_cache/", ".mypy_cache/", "target/"]
+GIT_SETTINGS = {".gitattributes", ".gitmodules", ".lfsconfig"}
+ABSENT = object()
+
+
+class WriterRefused(RuntimeError):
+    """The writer did something that ends the run without a push. The message finishes "the writer ..."."""
 
 
 def sync_tree(src, dst):
-    """Mirror src's working files onto dst. Never copies or touches .git; symlinks stay links."""
-    cmd = ["rsync", "-a", "--delete", "--no-specials", "--no-devices"]
-    for e in SYNC_EXCLUDES:
+    """Mirror src's working files onto dst. Never copies or touches .git; symlinks stay links.
+    --checksum: the default size-and-mtime check skips an edit that keeps a file's size and mtime."""
+    cmd = ["rsync", "-a", "--checksum", "--delete", "--no-specials", "--no-devices", "--exclude", GIT_EXCLUDE]
+    for e in DIR_EXCLUDES:
+        cmd += ["--exclude", e]
+    must(cmd + [src.rstrip("/") + "/", dst.rstrip("/") + "/"], 900)
+
+
+def fold_name(name):
+    """A file name as git on a case-insensitive disk would see it: composed form, no invisible format
+    characters (HFS+ ignores them), case-folded."""
+    name = unicodedata.normalize("NFC", name)
+    return "".join(c for c in name if unicodedata.category(c) != "Cf").casefold()
+
+
+def scan_tree(root):
+    """(links {path: target}, git settings {path: bytes, or None if not a plain file}, git-like names) of a
+    tree, walked the way sync_tree sees it: never through a link, not into the folders rsync skips. A real
+    `.git` folder is skipped like rsync skips it; any other entry that folds to `.git` is reported."""
+    links, settings, git_names = {}, {}, []
+
+    def broken(err):
+        raise err
+    for folder, dirs, files in os.walk(root, topdown=True, followlinks=False, onerror=broken):
+        for name in dirs + files:
+            path = os.path.join(folder, name)
+            rel = os.path.relpath(path, root)
+            is_link = os.path.islink(path)
+            if is_link:
+                links[rel] = os.readlink(path)
+            folded = fold_name(name)
+            if folded == ".git":
+                if name != ".git" or is_link or name not in dirs:
+                    git_names.append(rel)
+            elif folded in GIT_SETTINGS:
+                data = None
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    with open(path, "rb") as f:
+                        data = f.read()
+                settings[rel] = data
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(folder, d))
+                   and d != ".git" and d + "/" not in DIR_EXCLUDES]
+    return links, settings, git_names
+
+
+def copy_problems(copy, trusted):
+    """What the writer did to its copy that must stop it reaching the trusted checkout, as phrases that
+    finish "the writer ...": git metadata of any spelling, any change to .gitattributes, .gitmodules or
+    .lfsconfig (a `-diff` attribute hides content from every diff, and the other two reach git itself),
+    and links the trusted checkout does not already have. A link the checks never look at would let a
+    later step read or write a file outside the checkout."""
+    links, settings, git_names = scan_tree(copy)
+    base_links, base_settings, _ = scan_tree(trusted)
+    out = ["created git metadata (%s)" % p for p in sorted(git_names)]
+    out += ["changed git settings (%s)" % p for p in sorted(set(settings) | set(base_settings))
+            if settings.get(p, ABSENT) != base_settings.get(p, ABSENT)]
+    out += ["added or changed a symbolic link (%s)" % p for p, target in sorted(links.items())
+            if base_links.get(p) != target]
+    return out
+
+
+def snapshot_tree(src, dst):
+    """A private, complete copy of src for checking. Unlike sync_tree it keeps git-named entries so
+    copy_problems can see them, and it starts from nothing each time."""
+    shutil.rmtree(dst, ignore_errors=True)
+    os.makedirs(dst)
+    cmd = ["rsync", "-a", "--no-specials", "--no-devices"]
+    for e in DIR_EXCLUDES:
         cmd += ["--exclude", e]
     must(cmd + [src.rstrip("/") + "/", dst.rstrip("/") + "/"], 900)
 
 
 def collect_agent_copy(agent_dir, holding, trusted):
-    """Move the agent's copy under HOME (which the sandbox cannot touch) before reading it, so a
-    leftover process cannot swap it for a symlink mid-sync. Then mirror it onto the trusted checkout
-    and move it back for the next round."""
+    """Move the agent's copy under HOME (which the sandbox cannot touch) before reading it, so a leftover
+    process cannot swap it for a symlink mid-sync. A process that kept a handle on the folder can still
+    change it after the move, so it is copied once into a snapshot nothing else holds, and that snapshot
+    is what gets checked and then mirrored onto the trusted checkout. The agent's copy goes back for the
+    next round. Returns copy_problems(); with any, nothing was synced."""
+    snapshot = holding + "-snapshot"
     try:
         os.rename(agent_dir, holding)
     except OSError as ex:
@@ -843,9 +923,16 @@ def collect_agent_copy(agent_dir, holding, trusted):
     try:
         if os.path.islink(holding) or not os.path.isdir(holding):
             raise RuntimeError("agent copy is not a plain directory; refusing to read it")
-        sync_tree(holding, trusted)
+        snapshot_tree(holding, snapshot)
     finally:
         os.rename(holding, agent_dir)
+    try:
+        problems = copy_problems(snapshot, trusted)
+        if not problems:
+            sync_tree(snapshot, trusted)
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
+    return problems
 
 
 def author(work, agent_dir, prompt, result_file):
@@ -1050,6 +1137,13 @@ def fix(repo, items_path):
     def result(status, text, **kw):
         outcome.append(dict(kw, repo=repo, status=status, set=sh, items=items_path, text=text))
 
+    def copy_ok():
+        problems = collect_agent_copy(agent_dir, holding, trusted)
+        if problems:
+            result("blocked", "Fix for %s was not pushed: the writer %s." % (
+                short, "; ".join(p[:140] for p in problems[:3])))
+        return not problems
+
     try:
         must(["gh", "repo", "clone", repo, trusted, "--", "--depth", "200"], 600)
         base = git(trusted, "rev-parse", "--abbrev-ref", "HEAD").strip()
@@ -1063,7 +1157,8 @@ def fix(repo, items_path):
             .replace("{{FINDINGS}}", json.dumps(items, indent=1))
         holding = trusted_root + "/agent-copy"
         res = author(work, agent_dir, prompt, result_file)
-        collect_agent_copy(agent_dir, holding, trusted)
+        if not copy_ok():
+            return
         if res.get("status") != "changes" or not git(trusted, "status", "--porcelain").strip():
             status = res.get("status") if res.get("status") in ("nofix", "failed") else "failed"
             result(status, "Couldn't auto-fix %s: %s" % (short, (res.get("notes") or "no changes made")[:220]), detail=res)
@@ -1098,7 +1193,8 @@ def fix(repo, items_path):
             res = author(work, agent_dir, prompt + "\n\n## Reviewer findings (round %d)\n\n%s\n\n"
                          "Fix each finding or rebut it with evidence. Then rewrite the result file, with `response` "
                          "listing what you did for each finding." % (rnd, verdict), result_file)
-            collect_agent_copy(agent_dir, holding, trusted)
+            if not copy_ok():
+                return
             history = "Previous review findings:\n%s\n\nAuthor's response:\n%s\n\n" % (verdict, res.get("response", ""))
 
         files = json.loads(must(["gh", "pr", "view", str(pr), "-R", repo, "--json", "files"], 60))["files"]
