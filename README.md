@@ -2,7 +2,7 @@
 
 patchkeep finds vulnerable dependencies in your GitHub repos and fixes them on its own. A sandboxed coding agent makes the fix, a second model reviews it, and it merges once checks pass. No human is in the loop.
 
-This project was called vulnwatch until November 2026. If you ran it under that name, move `~/.config/vulnwatch` to `~/.config/patchkeep` and `~/.local/state/vulnwatch` to `~/.local/state/patchkeep`, and point your cron line at `patchkeep.py`.
+This project was called vulnwatch until November 2026. If you ran it under that name, move `~/.config/vulnwatch` to `~/.config/patchkeep` and `~/.local/state/vulnwatch` to `~/.local/state/patchkeep`, change any `vulnwatch` path in your `config.toml` (`state_dir` overrides the new default, so an old value keeps the old folder), rename `VULNWATCH_CONFIG` to `PATCHKEEP_CONFIG` if you set it, and point your cron line at `patchkeep.py`.
 
 Each pass takes a few minutes:
 

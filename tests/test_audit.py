@@ -802,6 +802,12 @@ class DependencyOnly(Branch):
             ("a source line that was already there and stays", "--index-url https://a.example\nx==1.0\n",
              "--index-url https://a.example\nx==1.1\n", True),
             ("a pin bump with env marker", 'x==1.0 ; python_version >= "3.9"\n', 'x==1.1 ; python_version >= "3.9"\n', True),
+            ("extras and a range", "x[a,b]>=1.0,<2\n", "x[a,b]>=1.1,<2\n", True),
+            ("the project itself", "x==1.0\n", "x==1.0\n.\n", False),
+            ("the parent folder", "x==1.0\n", "x==1.0\n..\n", False),
+            ("an archive by file name", "x==1.0\n", "x==1.0\nevil-1.0.tar.gz\n", False),
+            ("a wheel by file name", "x==1.0\n", "x==1.0\nevil-1.0-py3-none-any.whl\n", False),
+            ("a name pip cannot read as a package", "x==1.0\n", "x==1.0\n_evil\n", False),
         ])
 
     def test_package_json(self):
@@ -826,6 +832,8 @@ class DependencyOnly(Branch):
             ("local tarball by name", base, pkg(dependencies={"x": "x-1.0.5.tgz"}), False),
             ("parent folder", base, pkg(dependencies={"x": ".."}), False),
             ("not json", base, "{", False),
+            ("false turned into 0", pkg(gypfile=False), pkg(gypfile=0), False),
+            ("true turned into 1 in a dependency map", pkg(dependencies={"x": True}), pkg(dependencies={"x": 1}), False),
         ])
 
     def test_pyproject(self):
@@ -848,6 +856,7 @@ class DependencyOnly(Branch):
              toml(extra='[tool.poetry.dependencies]\nx = {path = "../x"}\n'), False),
             ("tool table changed", base, toml(extra='[tool.hatch.build]\nhooks = "evil"\n'), False),
             ("invalid toml", base, "[", False),
+            ("a true turned into 1", toml(extra="[tool.x]\na = true\n"), toml(extra="[tool.x]\na = 1\n"), False),
         ])
 
     def test_go_mod(self):

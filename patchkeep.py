@@ -1404,6 +1404,16 @@ PIP_OPTION = re.compile(r"(?:^|\s)-")
 CODING_DECLARATION = re.compile(r"coding[:=]")
 
 
+def same(a, b):
+    """Equal as the same data of the same types. Python's == takes False for 0 and True for 1, which
+    npm and pip do not: `"gypfile": 0` turns on a node-gyp build that `false` turns off."""
+    return canonical_json(a) == canonical_json(b)
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, default=lambda v: "%s:%r" % (type(v).__name__, v))
+
+
 def registry_specs_only(old, new):
     """True when every string value added or changed in the dependency map `new` (against `old`, nested
     maps included) is a registry version spec or a `$name` reference, never a URL, path or git source."""
@@ -1411,7 +1421,7 @@ def registry_specs_only(old, new):
         return False
     old = old if isinstance(old, dict) else {}
     for key, val in new.items():
-        if old.get(key, ABSENT) == val:
+        if key in old and same(old[key], val):
             continue
         if isinstance(val, dict):
             ok = registry_specs_only(old.get(key), val)
@@ -1442,7 +1452,7 @@ def package_json_ok(old_text, new_text):
     def pnpm_overrides(doc):
         return doc["pnpm"].get("overrides") if isinstance(doc.get("pnpm"), dict) else None
 
-    if rest(old) != rest(new):
+    if not same(rest(old), rest(new)):
         return False
     maps = [(old.get(k), new[k]) for k in NPM_DEP_SECTIONS if k in new]
     if pnpm_overrides(new) is not None:
@@ -1488,7 +1498,7 @@ def poetry_entries_ok(old, new):
         return False
     old = old if isinstance(old, dict) else {}
     for name, spec in new.items():
-        if old.get(name, ABSENT) == spec:
+        if name in old and same(old[name], spec):
             continue
         for one in spec if isinstance(spec, list) else [spec]:
             if not (isinstance(one, str) or (isinstance(one, dict) and set(one) <= POETRY_ENTRY_KEYS)):
@@ -1505,7 +1515,7 @@ def pyproject_ok(old_text, new_text):
     for path in PYPROJECT_DEP_TABLES:
         old_deps.update(take_toml(old, path))
         new_deps.update(take_toml(new, path))
-    if old != new:
+    if not same(old, new):
         return False
     return all((poetry_entries_ok if p[:2] == ("tool", "poetry") else requirements_ok)(old_deps.get(p), v)
                for p, v in new_deps.items())
@@ -1590,6 +1600,19 @@ PIP_COMMENT = re.compile(r"(^|\s+)#.*$")
 # An option (-e, -r, --index-url, ...) or anything that names a source other than the index: a direct
 # reference (`name @ url`), a URL or a path.
 PIP_SOURCE = re.compile(r"(?:^|\s)-|@|://|/|\\")
+# The only line that names nothing but a package on the index: a PEP 508 name, extras, version
+# specifiers and an environment marker. Anything else (`.`, a folder, an archive file name) pip may
+# install from disk, running its build hooks.
+PIP_SPEC = r"(?:===|==|~=|!=|<=|>=|<|>)\s*[A-Za-z0-9.*+!_-]+\s*"
+PIP_PLAIN = re.compile(r"(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[A-Za-z0-9._,\s-]*\])?\s*"
+                       r"(?:%s(?:,\s*%s)*)?(?:;[A-Za-z0-9_.<>=!~'\"() \t]*)?" % (PIP_SPEC, PIP_SPEC))
+ARCHIVE_NAME = re.compile(r"\.(?:zip|whl|tar|tgz|tbz2?|txz|tlz|tar\.gz|tar\.bz2|tar\.xz|tar\.lz|tar\.lzma)$", re.I)
+
+
+def plain_requirement(line):
+    """True for a requirements line that pip can only resolve from the package index."""
+    m = PIP_PLAIN.fullmatch(line)
+    return bool(m) and not ARCHIVE_NAME.search(m.group("name")) and not PIP_SOURCE.search(line)
 
 
 def pip_logical_lines(text):
@@ -1617,7 +1640,7 @@ def pip_sources_changed(repo_dir, base, path):
     continuation lines are not sources."""
     def risky(rev):
         text = blob(repo_dir, rev, path)
-        return None if text is None else sorted(l for l in pip_logical_lines(text) if PIP_SOURCE.search(l))
+        return None if text is None else sorted(l for l in pip_logical_lines(text) if l and not plain_requirement(l))
     old, new = risky("origin/" + base), risky("HEAD")
     return new is None or (old or []) != new
 
