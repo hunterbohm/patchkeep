@@ -97,10 +97,6 @@ LOCKFILES = {
     "uv.lock",
 }
 SKIP_PATH = re.compile(r"(^|/)(node_modules|vendor|\.worktrees|fixtures|__fixtures__|testdata|examples?)/")
-DEP_FILES = LOCKFILES | {
-    "package.json", "pnpm-workspace.yaml", ".npmrc", ".yarnrc.yml", "pyproject.toml",
-    "requirements.in", "Pipfile", "Pipfile.lock", "go.mod", "Cargo.toml", "Gemfile", "mix.exs",
-}
 
 
 # ---------------------------------------------------------------- helpers
@@ -694,10 +690,6 @@ def watch(dry=False):
 REVIEW_ASK = "Review this PR. Reply AGREE, or a numbered list of findings, each with file:line and the failing behavior."
 
 
-def is_dep_file(path):
-    return os.path.basename(path) in DEP_FILES
-
-
 def git(repo_dir, *args, timeout=300):
     """git in a trusted checkout only. Hooks and fsmonitor are off as a second guard."""
     return must(["git", "-C", repo_dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
@@ -773,9 +765,9 @@ def link_problems(repo_dir, base):
 
 
 # CI runs a pushed branch with the repo's secrets, and a workflow or local action the writer edited is
-# what it would run. A dependency fix never needs to touch them, so any edit there is refused. Matched
-# without regard to case: the writer's disk may not tell `.GitHub` from `.github`.
-CI_PATH = re.compile(r"^\.github/(workflows|actions)/", re.I)
+# what it would run. A dependency fix never needs to touch anything under .github, so any edit there is
+# refused. Matched without regard to case: the writer's disk may not tell `.GitHub` from `.github`.
+CI_PATH = re.compile(r"^\.github/", re.I)
 
 
 def branch_problem(repo_dir, base):
@@ -791,7 +783,7 @@ def branch_problem(repo_dir, base):
         return "it adds or changes a symbolic link (%s)" % ", ".join(links[:3])
     ci = [p for p in paths if CI_PATH.match(p)]
     if ci:
-        return "it edits CI files (%s)" % ", ".join(ci[:3])
+        return "it edits files under .github (%s)" % ", ".join(ci[:3])
     return None
 
 
@@ -807,14 +799,16 @@ def split_diff(diff):
 
 
 def foreign_sources(diff):
-    """Hosts on added lockfile lines that are not well-known package registries."""
+    """Hosts on added lockfile lines that are not well-known package registries, whatever the URL scheme
+    (git://, ssh:// and git+https:// pull code too). The host is the whole text up to the first slash, so
+    `registry.npmjs.org@evil.example` or a port is not mistaken for an allowed host."""
     hosts = set()
     for path, text in split_diff(diff):
         if os.path.basename(path) not in LOCKFILES:
             continue
         for line in diff_lines(text):
             if line.startswith("+"):
-                hosts |= {h.lower() for h in re.findall(r"https?://([^/\s\"']+)", line)} - REGISTRY_HOSTS
+                hosts |= {h.lower() for h in re.findall(r"[a-z][a-z0-9+.-]*://([^/\s\"']+)", line, re.I)} - REGISTRY_HOSTS
     return sorted(hosts)
 
 
@@ -1019,46 +1013,62 @@ def paged(path, key):
     return [x for page in json.loads(so) for x in page.get(key, [])]
 
 
+def outcome_of(r):
+    if r["status"] != "completed":
+        return "pending"
+    return "pass" if r["conclusion"] in ("success", "neutral") else "skip" if r["conclusion"] == "skipped" else "fail"
+
+
 def commit_checks(repo, sha):
-    """(outcomes, workflow paths with a run) for every check run, commit status and Actions run
-    on exactly `sha`."""
-    out, paths = [], set()
+    """(outcomes, runs, jobs) for every check run, commit status and Actions run on exactly `sha`.
+    `runs` is {workflow path: [(run outcome, check suite id)]} and `jobs` is {check suite id: [job
+    outcomes]}. A run and the jobs it started share a check suite, which is what shows whether a workflow's
+    jobs really ran or were all skipped."""
+    out, runs, jobs = [], {}, {}
     for r in paged("repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha), "check_runs"):
-        out.append("pending" if r["status"] != "completed" else
-                   "pass" if r["conclusion"] in ("success", "neutral") else
-                   "skip" if r["conclusion"] == "skipped" else "fail")
+        out.append(outcome_of(r))
+        jobs.setdefault((r.get("check_suite") or {}).get("id"), []).append(outcome_of(r))
     latest = {}
     for st in gh_json("repos/%s/commits/%s/statuses?per_page=100" % (repo, sha), paginate=True):
         latest.setdefault(st["context"], st["state"])
     for state in latest.values():
         out.append({"success": "pass", "pending": "pending"}.get(state, "fail"))
     for r in paged("repos/%s/actions/runs?head_sha=%s&per_page=100" % (repo, sha), "workflow_runs"):
-        paths.add(r.get("path", "").split("@", 1)[0])
-        out.append("pending" if r["status"] != "completed" else
-                   "pass" if r["conclusion"] in ("success", "neutral") else
-                   "skip" if r["conclusion"] == "skipped" else "fail")
-    return out, paths
+        runs.setdefault(r.get("path", "").split("@", 1)[0], []).append((outcome_of(r), r.get("check_suite_id")))
+        out.append(outcome_of(r))
+    return out, runs, jobs
+
+
+def unproven_workflows(required, runs, jobs):
+    """Required workflows with no run that succeeded and started a job that passed. A workflow whose jobs
+    were all skipped (a path filter, an `if:`) succeeds without testing anything. Skipped jobs inside a
+    run that also has a passing job are fine: deploy jobs skip on pull requests."""
+    return sorted(w for w in required if not any(
+        o == "pass" and suite is not None and "pass" in jobs.get(suite, ()) for o, suite in runs.get(w, ())))
 
 
 def checks_state(repo, sha, required, settle=180):
-    """'pass', 'none', 'fail' or 'error' for everything reported on exactly `sha`.
-    `required` is the set of workflow paths that must each have a run. Waits at least `settle`
-    seconds and for two identical polls. 'none' only when nothing is required and nothing ran."""
+    """'pass', 'none', 'skipped', 'fail' or 'error' for everything reported on exactly `sha`.
+    `required` is the set of workflow paths that must each have a run that passed. Waits at least `settle`
+    seconds and for two identical polls. 'skipped' is a settled result in which a required workflow ran
+    but proved nothing. 'none' only when nothing is required and nothing ran."""
     start, prev = now(), None
     while True:
         try:
-            got, paths = commit_checks(repo, sha)
+            got, runs, jobs = commit_checks(repo, sha)
             got = sorted(got)
         except Exception:
             return "error"
         if "fail" in got:
             return "fail"
         waited = now() - start
-        settled = waited >= settle and got == prev and required <= paths
-        if settled and "pass" in got and "pending" not in got:
-            return "pass"
-        if settled and not required and not [g for g in got if g != "skip"]:
-            return "none"
+        if waited >= settle and got == prev and required <= set(runs) and "pending" not in got:
+            if unproven_workflows(required, runs, jobs):
+                return "skipped"
+            if "pass" in got:
+                return "pass"
+            if not required and not [g for g in got if g != "skip"]:
+                return "none"
         if waited > 2400:
             return "fail" if (required or "pending" in got) else "none"
         prev = got
@@ -1133,7 +1143,7 @@ def revert_if_main_breaks(repo, pr, trusted, base, short, url):
     agree, _ = sol_review(body, raw_diff(trusted, "origin/%s...HEAD" % base), "")
     if not agree:
         return " It broke checks on main. Revert is ready but the reviewer didn't agree: %s" % rurl
-    if checks_state(repo, rsha, pr_workflows(trusted)) in ("fail", "error"):
+    if checks_state(repo, rsha, pr_workflows(trusted)) in ("fail", "error", "skipped"):
         return " It broke checks on main. Revert PR %s failed its own checks, so it's not merged." % rurl
     if killed("DISABLE_AUTOFIX") or killed("DISABLE_AUTOMERGE"):
         return " It broke checks on main. Revert PR is ready but auto-merge is switched off: %s" % rurl
@@ -1149,6 +1159,269 @@ def pkg_list(fixed):
         if name and name not in names:
             names.append(name)
     return ", ".join(names[:6]) + (" +%d more" % (len(names) - 6) if len(names) > 6 else "")
+
+
+# ---------------------------------------------------------------- the merge gate
+
+# What may change in a manifest without CI: only entries naming a dependency. Everything else in these
+# files (scripts, build backends, sources, registries) can run code, and a lockfile edit proves nothing
+# about it.
+NPM_DEP_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies",
+                    "overrides", "resolutions")
+REGISTRY_SPEC = re.compile(r"(npm:(@[\w.-]+/)?[\w.-]+@)?[\w.^~<>=|* +-]*")
+# npm reads a spec that starts with "." or ends in a tarball name as a local path, whatever its characters.
+# Its own pattern has an unescaped dot in "tar.gz" and ignores trailing whitespace; this is at least as wide.
+LOCAL_SPEC = re.compile(r"^\s*\.|[.](tgz|tar.gz|tar)\s*\Z|[.](tgz|tar)", re.I)
+OVERRIDE_REF = re.compile(r"\$(@[\w.-]+/)?[\w.-]+")
+PYPROJECT_DEP_TABLES = [("project", "dependencies"), ("project", "optional-dependencies"), ("dependency-groups",),
+                        ("tool", "poetry", "dependencies"), ("tool", "poetry", "dev-dependencies"),
+                        ("tool", "poetry", "group", "*", "dependencies"),
+                        ("tool", "uv", "constraint-dependencies"), ("tool", "uv", "override-dependencies")]
+POETRY_ENTRY_KEYS = {"version", "extras", "markers", "python", "optional"}
+GO_DIRECTIVES = {"module", "go", "toolchain", "godebug", "require", "exclude", "replace", "retract", "tool"}
+# Mix evaluates mix.lock as Elixir code, so unlike the other lockfiles it is not just data.
+CODE_LOCKFILES = {"mix.lock"}
+PIP_OPTION = re.compile(r"(?:^|\s)-")
+CODING_DECLARATION = re.compile(r"coding[:=]")
+
+
+def registry_specs_only(old, new):
+    """True when every string value added or changed in the dependency map `new` (against `old`, nested
+    maps included) is a registry version spec or a `$name` reference, never a URL, path or git source."""
+    if not isinstance(new, dict):
+        return False
+    old = old if isinstance(old, dict) else {}
+    for key, val in new.items():
+        if old.get(key, ABSENT) == val:
+            continue
+        if isinstance(val, dict):
+            ok = registry_specs_only(old.get(key), val)
+        else:
+            ok = isinstance(val, str) and bool(REGISTRY_SPEC.fullmatch(val) or OVERRIDE_REF.fullmatch(val)) \
+                and not LOCAL_SPEC.search(val)
+        if not ok:
+            return False
+    return True
+
+
+def package_json_ok(old_text, new_text):
+    try:
+        old, new = json.loads(old_text), json.loads(new_text)
+    except ValueError:
+        return False
+    if not (isinstance(old, dict) and isinstance(new, dict)):
+        return False
+
+    def rest(doc):
+        doc = {k: v for k, v in doc.items() if k not in NPM_DEP_SECTIONS}
+        if isinstance(doc.get("pnpm"), dict):
+            doc["pnpm"] = {k: v for k, v in doc["pnpm"].items() if k != "overrides"}
+            if not doc["pnpm"]:
+                del doc["pnpm"]
+        return doc
+
+    def pnpm_overrides(doc):
+        return doc["pnpm"].get("overrides") if isinstance(doc.get("pnpm"), dict) else None
+
+    if rest(old) != rest(new):
+        return False
+    maps = [(old.get(k), new[k]) for k in NPM_DEP_SECTIONS if k in new]
+    if pnpm_overrides(new) is not None:
+        maps.append((pnpm_overrides(old), pnpm_overrides(new)))
+    return all(registry_specs_only(o, n) for o, n in maps)
+
+
+def take_toml(doc, path):
+    """Remove the entries at `path` ("*" matches any key) from `doc` and return them as {path: value}.
+    A table that held only what was removed goes too, so a new group holding only dependencies leaves
+    nothing behind."""
+    key, rest = path[0], path[1:]
+    out = {}
+    if not isinstance(doc, dict):
+        return out
+    for k in (list(doc) if key == "*" else [key]):
+        if k not in doc:
+            continue
+        if rest:
+            got = take_toml(doc[k], rest)
+            out.update({(k,) + p: v for p, v in got.items()})
+            if got and doc[k] == {}:
+                del doc[k]
+        else:
+            out[(k,)] = doc.pop(k)
+    return out
+
+
+def requirements_ok(old, new):
+    """True when every PEP 508 string added in `new` (lists, or tables of lists) names a package by
+    registry spec: a `@` or `://` would be a direct URL."""
+    if isinstance(new, dict):
+        old = old if isinstance(old, dict) else {}
+        return all(requirements_ok(old.get(k), v) for k, v in new.items())
+    if isinstance(new, list):
+        old = old if isinstance(old, list) else []
+        return all(isinstance(r, str) and "@" not in r and "://" not in r for r in new if r not in old)
+    return False
+
+
+def poetry_entries_ok(old, new):
+    if not isinstance(new, dict):
+        return False
+    old = old if isinstance(old, dict) else {}
+    for name, spec in new.items():
+        if old.get(name, ABSENT) == spec:
+            continue
+        for one in spec if isinstance(spec, list) else [spec]:
+            if not (isinstance(one, str) or (isinstance(one, dict) and set(one) <= POETRY_ENTRY_KEYS)):
+                return False
+    return True
+
+
+def pyproject_ok(old_text, new_text):
+    try:
+        old, new = tomllib.loads(old_text), tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError:
+        return False
+    old_deps, new_deps = {}, {}
+    for path in PYPROJECT_DEP_TABLES:
+        old_deps.update(take_toml(old, path))
+        new_deps.update(take_toml(new, path))
+    if old != new:
+        return False
+    return all((poetry_entries_ok if p[:2] == ("tool", "poetry") else requirements_ok)(old_deps.get(p), v)
+               for p, v in new_deps.items())
+
+
+def go_mod_entries(text):
+    """[(directive, entry)] for a go.mod, `directive ( ... )` blocks flattened and comments dropped.
+    None for anything that isn't plainly written: a quoted or raw string (where a `//` or `)` may sit
+    inside the string), a `)` that isn't alone on its line, or a directive name inside a block. Go's own
+    parser would read some of those differently, so they need CI."""
+    out, block = [], None
+    for raw in text.splitlines():
+        if '"' in raw or "`" in raw:
+            return None
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if block is not None:
+            if line == ")":
+                block = None
+                continue
+            if ")" in line or "(" in line or line.split(None, 1)[0] in GO_DIRECTIVES:
+                return None
+            out.append((block, " ".join(line.split())))
+            continue
+        parts = line.split(None, 1)
+        directive, rest = parts[0], (parts[1].strip() if len(parts) > 1 else "")
+        if rest == "(":
+            block = directive
+        elif "(" in rest or ")" in rest:
+            return None
+        else:
+            out.append((directive, " ".join(rest.split())))
+    return None if block is not None else out
+
+
+def go_mod_ok(old_text, new_text):
+    """Only `require` lines may change: go.sum pins what they fetch. toolchain, replace and the rest can
+    point the build at other code."""
+    old, new = go_mod_entries(old_text), go_mod_entries(new_text)
+    if old is None or new is None:
+        return False
+    return sorted(e for e in old if e[0] != "require") == sorted(e for e in new if e[0] != "require")
+
+
+MANIFEST_CHECKS = {"package.json": package_json_ok, "pyproject.toml": pyproject_ok, "go.mod": go_mod_ok}
+
+
+def blob_bytes(repo_dir, rev, path):
+    """A file's bytes at `rev`, or None when it isn't there. Read from git, never through a link."""
+    try:
+        return git_bytes(repo_dir, "show", "%s:%s" % (rev, path), timeout=120)
+    except RuntimeError:
+        return None
+
+
+def blob(repo_dir, rev, path):
+    """A file's text at `rev`, or None when it isn't there or isn't valid UTF-8."""
+    data = blob_bytes(repo_dir, rev, path)
+    try:
+        return None if data is None else data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def plain_requirements(repo_dir, base, path):
+    """True when pip reads this requirements file as the same characters this process does: it, and the
+    version in the base when there is one, is pure ASCII with no NUL and no coding declaration in the first
+    two lines. pip decodes a file by its byte-order mark or a `coding:` line (UTF-16, EBCDIC...) before it
+    looks for options, which would hide an `-e` or `--index-url` line from a text check."""
+    for rev in ("origin/" + base, "HEAD"):
+        data = blob_bytes(repo_dir, rev, path)
+        if data is None:
+            continue
+        text = data.decode("latin-1")
+        if not data.isascii() or "\x00" in text or CODING_DECLARATION.search("\n".join(text.split("\n")[:2])):
+            return False
+    return True
+
+
+def pip_option_lines(repo_dir, base, path):
+    """Added or removed lines of a requirements file that are pip options (-e, -r, --index-url, ...),
+    which can point pip at another source. `--hash` pins on their own lines are not."""
+    out, in_hunk = [], False
+    for line in diff_lines(raw_diff(repo_dir, "-U0", "origin/%s...HEAD" % base, "--", path)):
+        # Only lines after the first @@ are content: a removed `--extra-index-url` line starts with `---`.
+        if line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line[:1] in "+-":
+            # pip splits a file with str.splitlines(), which breaks at more than git's newline, so a
+            # comment that git sees running to the end of the line may end early for pip.
+            for piece in line[1:].splitlines() or [""]:
+                text = re.sub(r"--hash[= ]\S+", "", re.sub(r"(?:^|\s)#.*$", "", piece))
+                if PIP_OPTION.search(text.strip()):
+                    out.append(line)
+                    break
+    return out
+
+
+def dependency_only(repo_dir, base, paths):
+    """True when every changed file may merge without PR CI, on the strength of the agent's sandboxed
+    before-and-after runs and the review: a lockfile (a requirements file without pip options), or a
+    manifest whose only changes are dependency entries. Anything else, such as .npmrc, package.json
+    scripts or a build backend, runs code that only CI would exercise. `paths` is the local commit's
+    whole file list."""
+    for path in paths:
+        name = os.path.basename(path)
+        if name in LOCKFILES and name not in CODE_LOCKFILES:
+            if name == "requirements.txt" and (not plain_requirements(repo_dir, base, path)
+                                               or pip_option_lines(repo_dir, base, path)):
+                return False
+            continue
+        if name not in MANIFEST_CHECKS:
+            return False
+        old, new = blob(repo_dir, "origin/" + base, path), blob(repo_dir, "HEAD", path)
+        if old is None or new is None or not MANIFEST_CHECKS[name](old, new):
+            return False
+    return True
+
+
+def merge_blockers(checks, dep_only):
+    """Why a pushed fix must not merge, in words; [] when it may. The review was settled before the push;
+    this is what only the pushed commit can show. `checks` is checks_state(). A required workflow that
+    ran but proved nothing ('skipped') counts like having no CI: a change that is only dependency
+    entries may merge, anything else may not."""
+    reasons = []
+    if checks in ("fail", "error"):
+        reasons.append("CI %s" % ("failed" if checks == "fail" else "status unknown"))
+    if checks == "skipped" and not dep_only:
+        reasons.append("its required CI was skipped, so nothing proved the change")
+    if checks == "none" and not dep_only:
+        reasons.append("it changes code or install-time config and no CI runs on pull requests to prove it")
+    if killed("DISABLE_AUTOMERGE") or killed("DISABLE_AUTOFIX"):
+        reasons.append("auto-merge is switched off")
+    return reasons
 
 
 def fix(repo, items_path):
@@ -1250,16 +1523,9 @@ def fix(repo, items_path):
         url = must(["gh", "pr", "create", "-R", repo, "--base", base, "--head", branch,
                     "--title", title, "--body", body], 120, trusted).strip()
         pr = int(url.rstrip("/").rsplit("/", 1)[-1])
-        files = json.loads(must(["gh", "pr", "view", str(pr), "-R", repo, "--json", "files"], 60))["files"]
-        dep_only = all(is_dep_file(f["path"]) for f in files)
         checks = checks_state(repo, sha, required_ci)
-        reasons = []
-        if checks in ("fail", "error"):
-            reasons.append("CI %s" % ("failed" if checks == "fail" else "status unknown"))
-        if checks == "none" and not dep_only:
-            reasons.append("it changes code and no CI runs on pull requests to prove it")
-        if killed("DISABLE_AUTOMERGE") or killed("DISABLE_AUTOFIX"):
-            reasons.append("auto-merge is switched off")
+        reasons = merge_blockers(checks, checks in ("none", "skipped") and dependency_only(
+            trusted, base, changed_paths(trusted, base)))
         if reasons:
             result("blocked", "Fix for %s is ready but not merged (%s): %s" % (short, "; ".join(reasons), url),
                    pr=url, sha=sha, verdict=verdict[:4000])

