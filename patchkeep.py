@@ -1398,8 +1398,6 @@ PYPROJECT_DEP_TABLES = [("project", "dependencies"), ("project", "optional-depen
                         ("tool", "uv", "constraint-dependencies"), ("tool", "uv", "override-dependencies")]
 POETRY_ENTRY_KEYS = {"version", "extras", "markers", "python", "optional"}
 GO_DIRECTIVES = {"module", "go", "toolchain", "godebug", "require", "exclude", "replace", "retract", "tool"}
-# Mix evaluates mix.lock as Elixir code, so unlike the other lockfiles it is not just data.
-CODE_LOCKFILES = {"mix.lock"}
 PIP_OPTION = re.compile(r"(?:^|\s)-")
 CODING_DECLARATION = re.compile(r"coding[:=]")
 
@@ -1649,37 +1647,123 @@ def pip_sources_changed(repo_dir, base, path):
     return new is None or (old or []) != new
 
 
-# Lockfile text that installs from somewhere other than a registry release, on a host the foreign-host
-# check allows or with no host at all: a local folder or file (npm, yarn, pnpm and bun `file:`, `link:`,
-# `portal:` and `workspace:` specs, npm's `"link": true`, uv's path, editable, directory and virtual
-# sources, poetry's directory and file sources, Gemfile.lock's PATH section), or a git checkout or
-# repository tarball on GitHub (uv's git source, poetry's and pnpm's `type = git`, Gemfile.lock's GIT
-# section, codeload.github.com archives). The next install runs that code's build or install scripts.
-LOCK_SOURCE = re.compile(
-    r"""\b(?:file|link|portal|workspace):|"link"\s*:\s*true|\b(?:path|editable|directory|virtual|git)\s*=|"""
-    r"""\btype\s*[:=]\s*["']?(?:directory|file|git|url)\b|^\s*(?:PATH|GIT)\s*$|://(?:codeload\.)?github\.com/""", re.I)
+# A lockfile may merge without CI only when a real parser reads it and every package in it is a registry
+# release or keeps the exact source it had in the base (the project itself, a workspace member). Anything
+# else, a local folder or file, a git checkout or a GitHub tarball, runs that code's build or install
+# scripts on the next install. Line patterns can be dodged by the other spellings a format allows (a
+# quoted TOML key, a JSON escape), so the parser decides, and a lockfile it cannot read needs CI: that is
+# yarn.lock, pnpm-lock.yaml, bun.lock and Gemfile.lock, which have no parser in the standard library, and
+# mix.lock, which Mix runs as Elixir code. go.sum holds only checksums; go.mod names the sources and has
+# its own check.
+RELEASE_HOSTS = REGISTRY_HOSTS - {"github.com", "codeload.github.com"}
+CRATES_IO = {"registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"}
+SEMVER = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?")
+NPM_SOURCE_KEYS = ("name", "version", "resolved", "link", "from")
+UV_FILE_KEYS = {"url", "hash", "size", "upload-time"}
 
 
-def lock_sources_added(repo_dir, base, path):
-    """Added lines of the lockfile `path` that name a source other than a registry release."""
-    diff = raw_diff(repo_dir, "origin/%s...HEAD" % base, "--", path)
-    return [l[1:] for l in diff_lines(diff)
-            if l.startswith("+") and not l.startswith("+++") and LOCK_SOURCE.search(l[1:])]
+def release_url(url):
+    """An https URL on a package registry's own host, not a GitHub checkout or tarball. The host is
+    everything up to the first slash, so a user name or a port is never taken for an allowed host."""
+    m = re.fullmatch(r"https://([^/@:\s]+)/\S*", url) if isinstance(url, str) else None
+    return bool(m) and m.group(1).lower() in RELEASE_HOSTS
+
+
+def npm_lock(text):
+    """{key: [entry]} for every package of a package-lock.json or npm-shrinkwrap.json: the `packages`
+    map of lockfile v2 and v3 by path, and the nested `dependencies` tree of v1 (also kept in v2)."""
+    doc = json.loads(text)
+    packages = doc.get("packages", {}) if isinstance(doc, dict) else None
+    if not isinstance(packages, dict):
+        raise ValueError("not a package lock")
+    out = {("packages", k): [v] for k, v in packages.items()}
+    stack = [("node_modules/", doc.get("dependencies", {}))]
+    while stack:
+        prefix, deps = stack.pop()
+        if not isinstance(deps, dict):
+            raise ValueError("not a package lock")
+        for name, entry in deps.items():
+            out.setdefault(("dependencies", prefix + name), []).append(entry)
+            if isinstance(entry, dict) and "dependencies" in entry:
+                stack.append((prefix + name + "/node_modules/", entry["dependencies"]))
+    return out
+
+
+def npm_registry(entry):
+    return (isinstance(entry, dict) and "link" not in entry and "from" not in entry
+            and release_url(entry.get("resolved"))
+            and isinstance(entry.get("version"), str) and bool(SEMVER.fullmatch(entry["version"])))
+
+
+def npm_source(entry):
+    return {k: entry.get(k) for k in NPM_SOURCE_KEYS} if isinstance(entry, dict) else entry
+
+
+def toml_packages(text):
+    """{name: [package]} for the `[[package]]` tables of a uv.lock, poetry.lock or Cargo.lock."""
+    packages = tomllib.loads(text).get("package", [])
+    if not isinstance(packages, list) or not all(isinstance(p, dict) and isinstance(p.get("name"), str)
+                                                 for p in packages):
+        raise ValueError("not a package list")
+    out = {}
+    for p in packages:
+        out.setdefault(p["name"], []).append(p)
+    return out
+
+
+def uv_registry(p):
+    source, files = p.get("source"), p.get("wheels", [])
+    if not isinstance(files, list):
+        return False
+    files = files + ([p["sdist"]] if "sdist" in p else [])
+    return (isinstance(source, dict) and list(source) == ["registry"] and release_url(source["registry"])
+            and all(isinstance(f, dict) and set(f) <= UV_FILE_KEYS and release_url(f.get("url")) for f in files))
+
+
+LOCK_READERS = {
+    "package-lock.json": (npm_lock, npm_registry, npm_source),
+    "npm-shrinkwrap.json": (npm_lock, npm_registry, npm_source),
+    "uv.lock": (toml_packages, uv_registry, lambda p: [p.get(k) for k in ("source", "sdist", "wheels")]),
+    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source")),
+    "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source")),
+}
+
+
+def lock_ok(name, old_text, new_text):
+    """True when the lockfile `name` may merge without CI, from its text in the base (None when it is new)
+    and on the branch (None when it is deleted): every package in it is a registry release, or installs from
+    the same place as a package under the same key in the base (for uv, its files as well as its source)."""
+    if name == "go.sum":
+        return True
+    if name not in LOCK_READERS or new_text is None:
+        return False
+    read, registry, source = LOCK_READERS[name]
+    try:
+        old, new = read(old_text) if old_text is not None else {}, read(new_text)
+        for key, packages in new.items():
+            before = [source(p) for p in old.get(key, [])]
+            for p in packages:
+                if not registry(p) and not any(same(source(p), b) for b in before):
+                    return False
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return False
+    return True
 
 
 def dependency_only(repo_dir, base, paths):
     """True when every changed file may merge without PR CI, on the strength of the agent's sandboxed
-    before-and-after runs and the review: a lockfile (a requirements file without pip options), or a
-    manifest whose only changes are dependency entries. Anything else, such as .npmrc, package.json
-    scripts or a build backend, runs code that only CI would exercise. `paths` is the local commit's
-    whole file list."""
+    before-and-after runs and the review: a lockfile whose packages all still come from a registry release
+    (lock_ok; a requirements file without pip options), or a manifest whose only changes are dependency
+    entries. Anything else, such as .npmrc, package.json scripts or a build backend, runs code that only
+    CI would exercise. `paths` is the local commit's whole file list."""
     for path in paths:
         name = os.path.basename(path)
-        if name in LOCKFILES and name not in CODE_LOCKFILES:
-            if name == "requirements.txt" and (not plain_requirements(repo_dir, base, path)
-                                               or pip_sources_changed(repo_dir, base, path)):
+        if name == "requirements.txt":
+            if not plain_requirements(repo_dir, base, path) or pip_sources_changed(repo_dir, base, path):
                 return False
-            if lock_sources_added(repo_dir, base, path):
+            continue
+        if name in LOCKFILES:
+            if not lock_ok(name, blob(repo_dir, "origin/" + base, path), blob(repo_dir, "HEAD", path)):
                 return False
             continue
         if name not in MANIFEST_CHECKS:

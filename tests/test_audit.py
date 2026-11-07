@@ -774,29 +774,59 @@ class DependencyOnly(Branch):
 
     def test_lockfile_sources_other_than_a_registry_release_need_ci(self):
         npm = LOCK.replace("1.2.3", "1.2.4")
+        tarball = "https://registry.npmjs.org/x/-/x-1.2.4.tgz"
+        v1 = lambda entry: json.dumps({"lockfileVersion": 1, "dependencies": {"x": entry}}) + "\n"
+        ws = json.loads(LOCK)
+        ws["packages"].update({"packages/a": {"name": "a", "version": "1.0.0"},
+                               "node_modules/a": {"resolved": "packages/a", "link": True}})
+        ws_new_link = json.loads(json.dumps(ws))
+        ws_new_link["packages"]["node_modules/b"] = {"resolved": "packages/a", "link": True}
+        ws, ws_new_link = json.dumps(ws, indent=2) + "\n", json.dumps(ws_new_link, indent=2) + "\n"
+        reg = '{ registry = "https://pypi.org/simple" }'
+        uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
+        app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
+        poetry = lambda version, extra="": '[[package]]\nname = "x"\nversion = "%s"\n%s' % (version, extra)
+        crates = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        cargo = lambda version, source=crates: '[[package]]\nname = "x"\nversion = "%s"\n%s' % (version, source)
+        member = '[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["x"]\n\n'
         rows = [
             ("package-lock.json", "registry bump", LOCK, npm, True),
-            ("package-lock.json", "local tarball", LOCK, npm.replace("https://registry.npmjs.org/x/-/x-1.2.4.tgz", "file:../x.tgz"), False),
+            ("package-lock.json", "local tarball", LOCK, npm.replace(tarball, "file:../x.tgz"), False),
             ("package-lock.json", "linked folder", LOCK, npm.replace('"integrity": "sha512-aaa"', '"link": true'), False),
-            ("package-lock.json", "repository tarball", LOCK, npm.replace("https://registry.npmjs.org/x/-/x-1.2.4.tgz",
-                                                                          "https://codeload.github.com/e/x/tar.gz/abc"), False),
-            ("yarn.lock", "registry bump", 'x@^1:\n  version "1.2.3"\n  resolved "https://registry.yarnpkg.com/x/-/x-1.2.3.tgz"\n',
-             'x@^1:\n  version "1.2.4"\n  resolved "https://registry.yarnpkg.com/x/-/x-1.2.4.tgz"\n', True),
-            ("yarn.lock", "portal", 'x@^1:\n  version "1.2.3"\n', 'x@portal:../x:\n  version "1.2.4"\n', False),
-            ("pnpm-lock.yaml", "directory resolution", "packages:\n  x@1.2.3:\n    resolution: {integrity: sha512-a}\n",
-             "packages:\n  x@1.2.4:\n    resolution: {directory: ../x, type: directory}\n", False),
-            ("uv.lock", "registry bump", '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
-             '[[package]]\nname = "x"\nversion = "1.1"\nsource = { registry = "https://pypi.org/simple" }\n', True),
-            ("uv.lock", "editable source", '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
-             '[[package]]\nname = "x"\nversion = "1.1"\nsource = { editable = "../x" }\n', False),
-            ("uv.lock", "git source", '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
-             '[[package]]\nname = "x"\nversion = "1.1"\nsource = { git = "https://github.com/e/x?rev=1#abc" }\n', False),
-            ("poetry.lock", "git source", '[[package]]\nname = "x"\nversion = "1.0"\n',
-             '[[package]]\nname = "x"\nversion = "1.1"\n\n[package.source]\ntype = "git"\nurl = "https://github.com/e/x.git"\n', False),
-            ("Gemfile.lock", "PATH section", "GEM\n  remote: https://rubygems.org/\n  specs:\n    x (1.0)\n",
-             "PATH\n  remote: ../x\n  specs:\n    x (1.1)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n", False),
-            ("Gemfile.lock", "GIT section", "GEM\n  remote: https://rubygems.org/\n  specs:\n    x (1.0)\n",
-             "GIT\n  remote: https://github.com/e/x.git\n  revision: abc\n  specs:\n    x (1.1)\n", False),
+            ("package-lock.json", "repository tarball", LOCK, npm.replace(tarball, "https://codeload.github.com/e/x/tar.gz/abc"), False),
+            ("package-lock.json", "a key spelled with an escape", LOCK,
+             npm.replace('"%s"' % tarball, '"%s", "\\u0072esolved": "file:../x.tgz"' % tarball), False),
+            ("package-lock.json", "lockfile v1 registry bump",
+             v1({"version": "1.2.3", "resolved": tarball.replace("4", "3")}), v1({"version": "1.2.4", "resolved": tarball}), True),
+            ("package-lock.json", "lockfile v1 git checkout",
+             v1({"version": "1.2.3", "resolved": tarball.replace("4", "3")}), v1({"version": "github:e/x#abc"}), False),
+            ("package-lock.json", "a workspace link kept", ws, ws.replace("1.2.3", "1.2.4"), True),
+            ("package-lock.json", "a new workspace link", ws, ws_new_link, False),
+            ("package-lock.json", "deleted", LOCK, None, False),
+            ("uv.lock", "registry bump", uv("1.0", reg), uv("1.1", reg, 'sdist = { url = "https://files.pythonhosted.org/x-1.1.tar.gz", '
+                                                                      'hash = "sha256:a", size = 1 }\n'), True),
+            ("uv.lock", "editable source", uv("1.0", reg), uv("1.1", '{ editable = "../x" }'), False),
+            ("uv.lock", "quoted key", uv("1.0", reg), uv("1.1", '{ "editable" = "../x" }'), False),
+            ("uv.lock", "key spelled with an escape", uv("1.0", reg), uv("1.1", '{ "edit\\u0061ble" = "../x" }'), False),
+            ("uv.lock", "git source", uv("1.0", reg), uv("1.1", '{ git = "https://github.com/e/x?rev=1#abc" }'), False),
+            ("uv.lock", "a GitHub tarball under a registry source", uv("1.0", reg),
+             uv("1.1", reg, 'sdist = { url = "https://codeload.github.com/e/x/tar.gz/abc" }\n'), False),
+            ("uv.lock", "a local file under a registry source", uv("1.0", reg), uv("1.1", reg, 'sdist = { path = "../x.tar.gz" }\n'), False),
+            ("uv.lock", "the project itself kept", app + "\n" + uv("1.0", reg),
+             app + '\n[package.metadata]\nrequires-dist = [{ name = "x", specifier = ">=1.1" }]\n\n' + uv("1.1", reg), True),
+            ("poetry.lock", "registry bump", poetry("1.0"), poetry("1.1"), True),
+            ("poetry.lock", "git source", poetry("1.0"),
+             poetry("1.1", '\n[package.source]\ntype = "git"\nurl = "https://github.com/e/x.git"\n'), False),
+            ("poetry.lock", "quoted key", poetry("1.0"), poetry("1.1", '"source" = { "type" = "directory", url = "../x" }\n'), False),
+            ("Cargo.lock", "registry bump", cargo("1.0.0"), cargo("1.0.1"), True),
+            ("Cargo.lock", "git source", cargo("1.0.0"), cargo("1.0.1", 'source = "git+https://github.com/e/x#abc"\n'), False),
+            ("Cargo.lock", "a new path crate", cargo("1.0.0"), cargo("1.0.0") + '\n[[package]]\nname = "y"\nversion = "0.1.0"\n', False),
+            ("Cargo.lock", "a workspace member kept", member + cargo("1.0.0"), member + cargo("1.0.1"), True),
+            ("yarn.lock", "registry bump, no parser", 'x@^1:\n  version "1.2.3"\n', 'x@^1:\n  version "1.2.4"\n', False),
+            ("pnpm-lock.yaml", "registry bump, no parser", "packages:\n  x@1.2.3: {}\n", "packages:\n  x@1.2.4: {}\n", False),
+            ("bun.lock", "registry bump, no parser", '{"packages": {"x": ["x@1.2.3"]}}\n', '{"packages": {"x": ["x@1.2.4"]}}\n', False),
+            ("Gemfile.lock", "registry bump, no parser", "GEM\n  remote: https://rubygems.org/\n  specs:\n    x (1.0)\n",
+             "GEM\n  remote: https://rubygems.org/\n  specs:\n    x (1.1)\n", False),
         ]
         for name, label, before, after, expect in rows:
             with self.subTest("%s: %s" % (name, label)):
