@@ -841,36 +841,181 @@ def split_diff(diff):
     return [(path, "\n".join(lines)) for path, lines in sections]
 
 
-GIT_SHORTHAND = re.compile(r"(?<![\w/.-])(?:github|gitlab|bitbucket|gist):[\w.-]+")
-SCP_URL = re.compile(r"(?<![\w/.:-])[\w.-]+@([\w.-]+):[\w./~-]")
+NPM_LOCKFILES = {"package-lock.json", "npm-shrinkwrap.json"}
+# npm lockfiles copy each package's "funding" field (a URL, an object, or a list of either). Those are
+# donation links, never download sources, so they must not trip the foreign-host check.
+NPM_FUNDING_START = re.compile(r"""^\s*"funding"\s*:\s*(.*)$""")
+# npm's deprecation notices and license fields are free text from the package author and often link to
+# a website. The package's real source is on its own "resolved" line, which is still checked, and the
+# parsed lock backs this up. pnpm and Yarn lockfiles are only read line by line, and in YAML a line that
+# starts as a notice can go on to set the source, so their notices are read like any other line.
+NPM_NOTE = re.compile(r'^\+\s*"(?:deprecated|license)"\s*:\s*"')
 
 
-def foreign_sources(diff):
-    """Hosts on added lockfile lines that are not well-known package registries, whatever the URL scheme
-    (git://, ssh:// and git+https:// pull code too). The host is the whole text up to the first slash, so
-    `registry.npmjs.org@evil.example` or a port is not mistaken for an allowed host. Git sources are
-    foreign even on an allowed host (`git+https://github.com/x/y` is a checkout, not a release), and so
-    are the shorthand `github:user/repo` and the scp form `git@host:path`."""
-    hosts = set()
-    for path, text in split_diff(diff):
-        if os.path.basename(path) not in LOCKFILES:
+def npm_funding_lines(lines):
+    """Indexes of diff lines that sit inside an npm "funding" field of the new file. A block cut off at a
+    hunk start is not recognised, so its URLs are still checked."""
+    skip, depth = set(), 0
+    for i, line in enumerate(lines):
+        if line[:1] not in "+ ":
+            if line.startswith("@@"):
+                depth = 0
             continue
-        for line in diff_lines(text):
-            if line.startswith("+"):
-                for scheme, host in re.findall(r"([a-z][a-z0-9+.-]*)://([^/\s\"']+)", line, re.I):
-                    if host.lower() not in REGISTRY_HOSTS or scheme.lower().startswith("git"):
-                        hosts.add(host.lower() if scheme.lower() == "https" or scheme.lower() == "http"
-                                  else "%s://%s" % (scheme.lower(), host.lower()))
-                hosts |= {m.group(0) for m in GIT_SHORTHAND.finditer(line)}
-                hosts |= {h.lower() for h in SCP_URL.findall(line)}
-    return sorted(hosts)
+        body = line[1:]
+        if depth:
+            skip.add(i)
+            depth += body.count("{") + body.count("[") - body.count("}") - body.count("]")
+            depth = max(depth, 0)
+            continue
+        m = NPM_FUNDING_START.match(body)
+        if m:
+            skip.add(i)
+            rest = m.group(1)
+            depth = max(rest.count("{") + rest.count("[") - rest.count("}") - rest.count("]"), 0)
+    return skip
+
+
+GIT_SHORTHAND = re.compile(r"(?<![\w/.-])(?:github|gitlab|bitbucket|gist):[\w.-]+")
+# `git@host:path`. Yarn writes its own protocols the same way (`x@npm:1.0.0`), and those are not hosts.
+SCP_URL = re.compile(r"(?<![\w/.:-])[\w.-]+@(?!(?:npm|patch|workspace|file|portal|link|exec|virtual):)([\w.-]+):[\w./~-]")
+URL_HOST = re.compile(r"([a-z][a-z0-9+.-]*)://([^/\s\"']+)", re.I)
+# Cargo names crates.io by its index on GitHub. Any other GitHub address in a lockfile is a checkout or a
+# source tarball, which runs that code's build and install scripts like any other foreign source.
+CRATES_INDEX = re.compile(r"registry\+https://github\.com/rust-lang/crates\.io-index(?=[\"')\s]|\Z)")
+JSON_LOCKS = {"package-lock.json", "npm-shrinkwrap.json", "Pipfile.lock"}
+TOML_LOCKS = {"uv.lock", "poetry.lock", "Cargo.lock"}
+# What hides text from a scan of lines in the formats read line by line: an escape, in YAML also a tag
+# (`!!binary` turns base64 into the text) outside a comment line, and in a POM a character reference or
+# an entity.
+YAML_HIDDEN = re.compile(r"^(?!\s*#).*?(?:\\|!)")
+HIDDEN_TEXT = {"pnpm-lock.yaml": YAML_HIDDEN, "yarn.lock": YAML_HIDDEN,
+               "pom.xml": re.compile(r"&#|<!ENTITY", re.I)}
+BACKSLASH = re.compile(r"\\")
+# Mix reads mix.lock by evaluating it as Elixir, so each line of it must be plain data: strings without
+# escapes or interpolation, atoms, keyword keys, numbers, true/false/nil and brackets. Anything else (a
+# call, `<>`, a sigil) is code that runs whenever mix reads the lock.
+MIX_TOKEN = re.compile(r'\s+|"[^"\\#]*":?|:"[^"\\#]*"|:[A-Za-z_]\w*[?!]?|[A-Za-z_]\w*:(?=\s)|(?:true|false|nil)\b'
+                       r'|-?\d+(?:\.\d+)?\b|%\{|[{}\[\],]|=>')
+
+
+def named_sources(text):
+    """The foreign sources a piece of lockfile text names: a URL whose host is not a release host, in any
+    scheme (git://, ssh:// and git+https:// pull code too), a git URL on any host, the shorthand
+    `github:user/repo`, and the scp form `git@host:path`. The host is the whole text up to the first
+    slash, so `registry.npmjs.org@evil.example` or a port is not taken for an allowed host."""
+    text = CRATES_INDEX.sub("", text)
+    found = set()
+    for scheme, host in URL_HOST.findall(text):
+        scheme, host = scheme.lower(), host.lower()
+        if host not in RELEASE_HOSTS or scheme.startswith("git"):
+            found.add(host if scheme in ("http", "https") else "%s://%s" % (scheme, host))
+    found |= {m.group(0) for m in GIT_SHORTHAND.finditer(text)}
+    found |= {h.lower() for h in SCP_URL.findall(text)}
+    return found
+
+
+def mix_data(line):
+    pos = 0
+    while pos < len(line):
+        m = MIX_TOKEN.match(line, pos)
+        if not m:
+            return False
+        pos = m.end()
+    return True
+
+
+def lock_strings(name, text):
+    """(field, string) for every string in a lockfile Python reads, keys included and escapes decoded,
+    `field` being the key it sits under. The funding links, deprecation notes and license fields of npm's
+    package entries and poetry's package descriptions are not sources and are left out. Raises ValueError when the text
+    does not parse."""
+    doc = json.loads(text) if name in JSON_LOCKS else tomllib.loads(text)
+    if name in NPM_LOCKFILES and isinstance(doc, dict) and isinstance(doc.get("packages"), dict):
+        doc = dict(doc, packages={k: {f: x for f, x in v.items() if f not in ("funding", "deprecated", "license")}
+                                  if isinstance(v, dict) else v for k, v in doc["packages"].items()})
+    out, stack = set(), [("", doc)]
+    while stack:
+        field, value = stack.pop()
+        if isinstance(value, dict):
+            for k, v in value.items():
+                out.add((field, k))
+                stack.append((k, v))
+        elif isinstance(value, list):
+            stack.extend((field, v) for v in value)
+        elif isinstance(value, str) and not (name == "poetry.lock" and field == "description"):
+            out.add((field, value))
+    return out
+
+
+def read_sources(repo_dir, base, path, name, section):
+    """The foreign sources in what the tools read from one changed lockfile, against its text in the base:
+    for JSON and TOML, strings that are new as decoded; for a requirements file, the lines pip joins, each
+    new one also having to name only a package on the index (an option such as `-r other.txt` pulls in a
+    file this check never reads)."""
+    if name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt"}:
+        return set()
+    new = blob(repo_dir, "HEAD", path)
+    if new is None:
+        return set() if "\ndeleted file mode" in section else {"a %s that is not UTF-8 text" % name}
+    old = blob(repo_dir, "origin/" + base, path)
+    found = set()
+    if name == "requirements.txt":
+        before = set(pip_logical_lines(old)) if old is not None else set()
+        for line in pip_logical_lines(new):
+            if line and line not in before:
+                found |= named_sources(line)
+                if not plain_requirement(line):
+                    found.add("a pip line that is not a package on the index: " + line[:80])
+        return found
+    try:
+        fresh = lock_strings(name, new)
+    except (ValueError, RecursionError):
+        return {"a %s that does not parse" % name}
+    try:
+        fresh -= lock_strings(name, old) if old is not None else set()
+    except (ValueError, RecursionError):
+        pass
+    for _, text in fresh:
+        found |= named_sources(text)
+    return found
+
+
+def foreign_sources(diff, repo_dir=None, base=None):
+    r"""The foreign sources a branch adds to its lockfiles (see named_sources), sorted: those on added diff
+    lines, and given `repo_dir` and `base`, those in what the tools read. A line can hide a URL behind an
+    escape (`https:\/\/` in JSON, `\u002F` or a multi-line string in TOML, a trailing backslash in a
+    requirements file), so a format Python reads is compared as decoded strings, a requirements file as
+    the lines pip joins, and in the formats read line by line a line with an escape counts as foreign.
+    Mix runs mix.lock as Elixir, so a line of it that is not plain data counts too."""
+    found = set()
+    for path, text in split_diff(diff):
+        name = os.path.basename(path) if os.path.basename(path) in LOCKFILES else None
+        if not name:
+            continue
+        lines = diff_lines(text)
+        skip = npm_funding_lines(lines) if name in NPM_LOCKFILES else set()
+        hunk = False
+        for i, line in enumerate(lines):
+            hunk = hunk or line.startswith("@@")
+            if not line.startswith("+") or (not hunk and line.startswith("+++ ")):
+                continue
+            if i not in skip and not (name in NPM_LOCKFILES and NPM_NOTE.match(line)):
+                found |= named_sources(line[1:])
+            if name == "mix.lock":
+                if not mix_data(line[1:]):
+                    found.add("Elixir code in mix.lock")
+            elif name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt"} and HIDDEN_TEXT.get(name, BACKSLASH).search(line[1:]):
+                found.add("an escape or a tag in " + name)
+        if repo_dir is not None:
+            found |= read_sources(repo_dir, base, path, name, text)
+    return sorted(found)
 
 
 def review_diff(repo_dir, base):
     """The branch diff for review, from the trusted checkout. Returns (diff, foreign hosts);
     diff is None if it is too big to review even after reduce_diff."""
     diff = raw_diff(repo_dir, "origin/%s...HEAD" % base)
-    return reduce_diff(diff), foreign_sources(diff)
+    return reduce_diff(diff), foreign_sources(diff, repo_dir, base)
 
 
 def reduce_diff(diff):
@@ -1765,7 +1910,38 @@ def npm_complete(old, new):
                             return False
                         cut = at.rfind("/node_modules/")
                         at = at[:cut] if cut >= 0 else ""
-    return True
+    return not npm_shadowed(old, new)
+
+
+def npm_folders(path, dep):
+    """Every folder Node or npm could find `dep` in for the package at `path`, nearest first: its own
+    node_modules, then that of each folder above it."""
+    parts = path.split("/") if path else []
+    return [("/".join(parts[:i]) + "/" if i else "") + "node_modules/" + dep for i in range(len(parts), -1, -1)]
+
+
+def npm_shadowed(old, new):
+    """True when a dependency whose spec names a source (git, a tarball, a path) would now be found in a
+    new folder nearer than where it was found in the base. npm installs the nearer entry, sees that it does
+    not satisfy the spec, and fetches the source afresh, so an entry that did not change can still change
+    what is installed."""
+    fold = lambda key: (key[0], unicodedata.normalize("NFC", key[1]).casefold())
+    before, added = {fold(k) for k in old}, {fold(k) for k in new if k not in old}
+    if not added:
+        return False
+    for (section, path), entries in new.items():
+        for entry in entries:
+            for field in NPM_NEEDS.get(section, ()):
+                deps = entry.get(field) if isinstance(entry, dict) else None
+                for dep, spec in (deps.items() if isinstance(deps, dict) else ()):
+                    if registry_specs_only(None, {dep: spec}):
+                        continue
+                    for folder in npm_folders(path, dep):
+                        if fold((section, folder)) in added:
+                            return True
+                        if fold((section, folder)) in before:
+                            break
+    return False
 
 
 def canon(name):

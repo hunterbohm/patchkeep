@@ -731,8 +731,14 @@ class NoCiRepo(Flow):
     def test_setup_py_is_blocked(self):
         self.assertFalse(self.merged({"setup.py": "import os; os.system('evil')\n"})[0])
 
-    def test_mix_lock_never_merges(self):
+    def test_code_in_mix_lock_is_not_even_pushed(self):
+        """Mix reads mix.lock by evaluating it as Elixir, so a line that is not plain data is code."""
         ok, text = self.merged({"mix.lock": '%{"x": {:hex, :x, "1.0.0"}}\nSystem.cmd("sh", ["-c", "evil"])\n'})
+        self.assertFalse(ok)
+        self.assertIn("Elixir code in mix.lock", text)
+
+    def test_mix_lock_never_merges(self):
+        ok, text = self.merged({"mix.lock": '%{"x": {:hex, :x, "1.0.1"}}\n'})
         self.assertFalse(ok)
         self.assertIn("no CI runs on pull requests", text)
 
@@ -823,6 +829,18 @@ class DependencyOnly(Branch):
         case_variant = json.loads(npm)
         case_variant["packages"]["node_modules/X"] = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/X/-/X-1.0.0.tgz"}
         second_path, case_variant = json.dumps(second_path, indent=2) + "\n", json.dumps(case_variant, indent=2) + "\n"
+        shadow = json.loads(git_x)
+        shadow["packages"]["node_modules/y"]["dependencies"] = {"x": "github:e/x#main"}
+        shadow_base = json.dumps(shadow, indent=2) + "\n"
+        shadow["packages"]["node_modules/y/node_modules/x"] = {"version": "1.2.4", "resolved": tarball}
+        shadowed = json.dumps(shadow, indent=2) + "\n"
+        nested = json.loads(git_x)
+        nested["packages"]["node_modules/y"]["dependencies"] = {"z": "^1.0.0"}
+        nested["packages"]["node_modules/z"] = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/z/-/z-1.0.0.tgz"}
+        nested_base = json.dumps(nested, indent=2) + "\n"
+        nested["packages"]["node_modules/y/node_modules/z"] = {"version": "1.5.0",
+                                                               "resolved": "https://registry.npmjs.org/z/-/z-1.5.0.tgz"}
+        nested_bump = json.dumps(nested, indent=2) + "\n"
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -870,6 +888,9 @@ class DependencyOnly(Branch):
             ("package-lock.json", "a git entry kept while another package is bumped", git_x, git_x_y_bumped, True),
             ("package-lock.json", "a second path for the same folder", git_x, second_path, False),
             ("package-lock.json", "two paths that differ only in case", npm_base, case_variant, False),
+            ("package-lock.json", "a registry entry that hides a git entry from the package that needs it",
+             shadow_base, shadowed, False),
+            ("package-lock.json", "a nested registry release for a registry range", nested_base, nested_bump, True),
             ("uv.lock", "a git source swapped for the registry", uv("1.0", '{ git = "https://github.com/e/x?rev=1#abc" }'),
              uv("1.0", reg), False),
             ("Cargo.lock", "a git crate swapped for a registry release", cargo("1.0.0", git_crate), cargo("1.0.0"), False),
@@ -1036,7 +1057,7 @@ class ForeignHosts(unittest.TestCase):
 
     def test_git_checkouts_are_foreign_even_on_an_allowed_host(self):
         self.assertEqual(self.hosts('"resolved": "git+https://github.com/x/y.git#abc"'), ["git+https://github.com"])
-        self.assertEqual(self.hosts('"resolved": "https://github.com/x/y/archive/abc.tar.gz"'), [])
+        self.assertEqual(self.hosts('"resolved": "https://github.com/x/y/archive/abc.tar.gz"'), ["github.com"])
 
     def test_shorthand_and_scp_forms_are_foreign(self):
         self.assertEqual(self.hosts('"resolved": "github:user/repo#abc"'), ["github:user"])
@@ -1486,6 +1507,80 @@ def _odd_break_test(ch):
 
 for _ch in ODD_BREAKS:
     setattr(CiEdits, "test_a_changed_workflow_line_holding_%04x_is_refused" % ord(_ch), _odd_break_test(_ch))
+
+
+class LockfileSources(Branch):
+    """foreign_sources on a real branch: what the tools read from each lockfile, not only its diff lines."""
+
+    def sources(self, name, before, after):
+        self.setUp()
+        if before is not None:
+            self.change({name: before}, "base")
+            sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.repo)
+        self.change({name: after})
+        return V.foreign_sources(V.raw_diff(self.repo, "origin/main...HEAD"), self.repo, "main")
+
+    def test_sources_hidden_from_a_line_scan_are_still_found(self):
+        def npm(resolved="https://registry.npmjs.org/x/-/x-1.0.0.tgz", **entry):
+            return json.dumps({"name": "app", "lockfileVersion": 3, "packages": {
+                "": {"name": "app", "dependencies": {"x": "^1.0.0"}},
+                "node_modules/x": dict({"version": "1.0.0", "resolved": resolved}, **entry)}}, indent=2) + "\n"
+        v1 = lambda deps: json.dumps({"name": "app", "lockfileVersion": 1, "dependencies": deps}, indent=2) + "\n"
+        reg_v1 = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/y/-/y-1.0.0.tgz"}
+        cargo = lambda version, source: '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n' % (version, source)
+        crates = '"registry+https://github.com/rust-lang/crates.io-index"'
+        poetry_git = ('[[package]]\nname = "x"\nversion = "1.0.0"\n\n[package.source]\ntype = "git"\n'
+                      'url = """https:\\\n    //evil.example/x.git"""\nreference = "main"\n')
+        yarn = 'x@^1.0.0:\n  version "1.0.0"\n  resolved "%s"\n'
+        berry = lambda v: '"x@npm:^1.0.0":\n  version: %s\n  resolution: "x@npm:%s"\n' % (v, v)
+        pnpm = "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution: %s\n"
+        mix = '%%{\n  "x": {:hex, :x, %s, "abc", [:mix], [], "hexpm", "def"},\n}\n'
+        mix_git = '%{\n  "x": {:git, "https://github.com/e/x.git", "abc", [branch: "main"]},\n}\n'
+        pnpm_flow = ("lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0: {\n"
+                     "    deprecated: 'x', resolution: {tarball: https://evil.example/x.tgz}}\n")
+        rows = [
+            ("package-lock.json", "a registry bump", npm(), npm("https://registry.npmjs.org/x/-/x-1.0.1.tgz"), []),
+            ("package-lock.json", "a URL behind JSON escapes", npm(), npm("https://evil.example/x.tgz").replace(
+                "https://evil.example/x.tgz", "https:\\/\\/evil.example\\/x.tgz"), ["evil.example"]),
+            ("package-lock.json", "a GitHub tarball", npm(), npm("https://codeload.github.com/e/x/tar.gz/abc"),
+             ["codeload.github.com"]),
+            ("package-lock.json", "a git checkout over ssh", npm(), npm("git+ssh://git@evil.example/x.git#abc"),
+             ["git+ssh://git@evil.example"]),
+            ("package-lock.json", "funding links and deprecation notes are not sources", npm(),
+             npm(funding={"url": "https://opencollective.com/x"}, deprecated="see https://docs.example.org"), []),
+            ("package-lock.json", "a v1 package named funding", v1({"y": reg_v1}),
+             v1({"y": reg_v1, "funding": {"version": "github:evil/x#abc", "from": "github:evil/x"}}), ["github:evil"]),
+            ("Cargo.lock", "a crates.io bump", cargo("1.0.0", crates), cargo("1.0.1", crates), []),
+            ("Cargo.lock", "a git source behind TOML escapes", cargo("1.0.0", crates),
+             cargo("1.0.0", '"git+https:\\u002F\\u002Fevil.example/x#abc"'), ["git+https://evil.example"]),
+            ("poetry.lock", "a URL split by a multi-line string", None, poetry_git, ["evil.example"]),
+            ("requirements.txt", "a hashed pin bump", "x==1.0 \\\n    --hash=sha256:aa\n",
+             "x==1.1 \\\n    --hash=sha256:bb\n", []),
+            ("requirements.txt", "an index URL split by a continuation", "x==1.0\n",
+             "x==1.0\n--extra-index-url https:\\\n//evil.example/simple\n",
+             ["a pip line that is not a package on the index: --extra-index-url https://evil.example/simple",
+              "evil.example"]),
+            ("requirements.txt", "another requirements file pulled in", "x==1.0\n", "x==1.0\n-r extra.txt\n",
+             ["a pip line that is not a package on the index: -r extra.txt"]),
+            ("yarn.lock", "an escaped URL", yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz",
+             yarn % "https:\\/\\/evil.example\\/x.tgz", ["an escape or a tag in yarn.lock"]),
+            ("yarn.lock", "a Yarn 2 protocol is not a host", berry("1.0.0"), berry("1.0.1"), []),
+            ("yarn.lock", "a comment line in a Yarn 2 lockfile", berry("1.0.0"),
+             "# Manual changes might be lost - proceed with caution!\n" + berry("1.0.1"), []),
+            ("package-lock.json", "a license note is not a source", npm(), npm(license="see https://gsap.example/license"), []),
+            ("pnpm-lock.yaml", "a deprecation notice is read like any other line", pnpm % "{integrity: sha512-AAAA}",
+             pnpm % "{integrity: sha512-AAAA}\n    deprecated: 'see https://docs.example.org'", ["docs.example.org"]),
+            ("pnpm-lock.yaml", "a source set on the line of a notice", pnpm % "{integrity: sha512-AAAA}", pnpm_flow,
+             ["evil.example"]),
+            ("pnpm-lock.yaml", "a binary tag", pnpm % "{integrity: sha512-AAAA}",
+             pnpm % "{tarball: !!binary aHR0cHM6Ly9ldmlsLmV4YW1wbGUveC50Z3o=}", ["an escape or a tag in pnpm-lock.yaml"]),
+            ("mix.lock", "a hex bump", mix % '"1.0.0"', mix % '"1.0.1"', []),
+            ("mix.lock", "code in mix.lock", mix % '"1.0.0"', mix % '"1.0." <> "1"', ["Elixir code in mix.lock"]),
+            ("mix.lock", "a git dependency on GitHub", mix % '"1.0.0"', mix_git, ["github.com"]),
+        ]
+        for name, why, before, after, want in rows:
+            with self.subTest(name=name, why=why):
+                self.assertEqual(self.sources(name, before, after), want)
 
 
 if __name__ == "__main__":
