@@ -634,6 +634,12 @@ class ChecksState(unittest.TestCase):
         self.assertEqual(self.checks([wf_run(CI, "skipped", 1), wf_run(LINT, "failure", 2)],
                                      [wf_job("skipped", 1, 1), wf_job("failure", 2, 2)]), "fail")
 
+    def test_a_run_that_succeeded_with_every_job_skipped_is_no_pass_when_nothing_is_required(self):
+        self.assertEqual(self.checks([wf_run(LINT, "success", 2)], [wf_job("skipped", 2)], required=()), "none")
+
+    def test_a_real_passing_job_is_a_pass_when_nothing_is_required(self):
+        self.assertEqual(self.checks([wf_run(LINT, "success", 2)], [wf_job("success", 2)], required=()), "pass")
+
     def test_nothing_required_and_nothing_that_ran_is_none(self):
         self.assertEqual(self.checks([wf_run(LINT, "skipped", 2)], [wf_job("skipped", 2)], required=()), "none")
 
@@ -786,6 +792,16 @@ class DependencyOnly(Branch):
             ("comment with a dash", "x==1.0\n", "x==1.1  # - bumped for a CVE\n", True),
             ("utf-16 file that hides its options", "x==1.0\n", "\ufeff-e .\n".encode("utf-16"), False),
             ("coding declaration", "x==1.0\n", "# coding: utf-16\nx==1.1\n", False),
+            ("direct reference to a git checkout", "x==1.0\n", "x==1.0\nevil @ git+https://github.com/e/e.git\n", False),
+            ("direct url reference", "x==1.0\n", "x==1.0\nevil @ https://evil.example/e.whl\n", False),
+            ("local path", "x==1.0\n", "x==1.0\n./vendor/evil\n", False),
+            ("continuation joins an option that was already there", "x==1.0\n--index-url https://a.example\n",
+             "x==1.0 \\\n--index-url https://a.example\n", False),
+            ("continuation after an option that was already there", "--index-url https://a.example\nx==1.0\n",
+             "--index-url https://a.example \\\nx==1.0\n", False),
+            ("a source line that was already there and stays", "--index-url https://a.example\nx==1.0\n",
+             "--index-url https://a.example\nx==1.1\n", True),
+            ("a pin bump with env marker", 'x==1.0 ; python_version >= "3.9"\n', 'x==1.1 ; python_version >= "3.9"\n', True),
         ])
 
     def test_package_json(self):
@@ -859,9 +875,18 @@ class ForeignHosts(unittest.TestCase):
         self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org/x/-/x-1.tgz"'), [])
 
     def test_other_schemes_are_read_too(self):
-        self.assertEqual(self.hosts('"resolved": "git://evil.example/x.git"'), ["evil.example"])
-        self.assertEqual(self.hosts('"resolved": "git+ssh://git@evil.example/x.git"'), ["git@evil.example"])
-        self.assertEqual(self.hosts('"resolved": "ssh://evil.example/x"'), ["evil.example"])
+        self.assertEqual(self.hosts('"resolved": "git://evil.example/x.git"'), ["git://evil.example"])
+        self.assertEqual(self.hosts('"resolved": "git+ssh://git@evil.example/x.git"'), ["git+ssh://git@evil.example"])
+        self.assertEqual(self.hosts('"resolved": "ssh://evil.example/x"'), ["ssh://evil.example"])
+
+    def test_git_checkouts_are_foreign_even_on_an_allowed_host(self):
+        self.assertEqual(self.hosts('"resolved": "git+https://github.com/x/y.git#abc"'), ["git+https://github.com"])
+        self.assertEqual(self.hosts('"resolved": "https://github.com/x/y/archive/abc.tar.gz"'), [])
+
+    def test_shorthand_and_scp_forms_are_foreign(self):
+        self.assertEqual(self.hosts('"resolved": "github:user/repo#abc"'), ["github:user"])
+        self.assertEqual(self.hosts('"resolved": "git@evil.example:user/repo.git"'), ["evil.example"])
+        self.assertEqual(self.hosts('"author": "me@example.com"'), [])
 
     def test_a_trick_that_ends_in_an_allowed_name_is_not_allowed(self):
         self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org@evil.example/x.tgz"'),

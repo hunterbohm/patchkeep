@@ -10,8 +10,9 @@ Run the watch pass every few minutes (cron, launchd, systemd). Its stdout is the
 notification text; empty stdout means nothing new. See README.md.
 
 Trust split: the fixer agent edits a plain copy of the repo inside an OS sandbox that denies
-every read and write under $HOME, so it never sees GitHub or git credentials. This script
-commits, pushes, opens the PR, runs the reviewer, and merges only the exact commit it pushed.
+every read and write under $HOME, so it never sees GitHub or git credentials, and treats that copy
+as hostile. This script commits locally, runs every check and the reviewer on that commit, and only
+then pushes, opens the PR, and merges the exact commit it pushed.
 
 Kill switches in the state dir (default ~/.local/state/vulnwatch):
   DISABLE_AUTOFIX    detect and notify only (also stops running fixers before push/merge)
@@ -839,17 +840,28 @@ def split_diff(diff):
     return [(path, "\n".join(lines)) for path, lines in sections]
 
 
+GIT_SHORTHAND = re.compile(r"(?<![\w/.-])(?:github|gitlab|bitbucket|gist):[\w.-]+")
+SCP_URL = re.compile(r"(?<![\w/.:-])[\w.-]+@([\w.-]+):[\w./~-]")
+
+
 def foreign_sources(diff):
     """Hosts on added lockfile lines that are not well-known package registries, whatever the URL scheme
     (git://, ssh:// and git+https:// pull code too). The host is the whole text up to the first slash, so
-    `registry.npmjs.org@evil.example` or a port is not mistaken for an allowed host."""
+    `registry.npmjs.org@evil.example` or a port is not mistaken for an allowed host. Git sources are
+    foreign even on an allowed host (`git+https://github.com/x/y` is a checkout, not a release), and so
+    are the shorthand `github:user/repo` and the scp form `git@host:path`."""
     hosts = set()
     for path, text in split_diff(diff):
         if os.path.basename(path) not in LOCKFILES:
             continue
         for line in diff_lines(text):
             if line.startswith("+"):
-                hosts |= {h.lower() for h in re.findall(r"[a-z][a-z0-9+.-]*://([^/\s\"']+)", line, re.I)} - REGISTRY_HOSTS
+                for scheme, host in re.findall(r"([a-z][a-z0-9+.-]*)://([^/\s\"']+)", line, re.I):
+                    if host.lower() not in REGISTRY_HOSTS or scheme.lower().startswith("git"):
+                        hosts.add(host.lower() if scheme.lower() == "https" or scheme.lower() == "http"
+                                  else "%s://%s" % (scheme.lower(), host.lower()))
+                hosts |= {m.group(0) for m in GIT_SHORTHAND.finditer(line)}
+                hosts |= {h.lower() for h in SCP_URL.findall(line)}
     return sorted(hosts)
 
 
@@ -1240,7 +1252,9 @@ def commit_checks(repo, sha):
         out.append({"success": "pass", "pending": "pending"}.get(state, "fail"))
     for r in paged("repos/%s/actions/runs?head_sha=%s&per_page=100" % (repo, sha), "workflow_runs"):
         runs.setdefault(r.get("path", "").split("@", 1)[0], []).append((outcome_of(r), r.get("check_suite_id")))
-        out.append(outcome_of(r))
+        # A run that succeeded because every job skipped tested nothing, so on its own it is no pass.
+        o = outcome_of(r)
+        out.append("skip" if o == "pass" and "pass" not in jobs.get(r.get("check_suite_id"), ()) else o)
     return out, runs, jobs
 
 
@@ -1572,23 +1586,40 @@ def plain_requirements(repo_dir, base, path):
     return True
 
 
-def pip_option_lines(repo_dir, base, path):
-    """Added or removed lines of a requirements file that are pip options (-e, -r, --index-url, ...),
-    which can point pip at another source. `--hash` pins on their own lines are not."""
-    out, in_hunk = [], False
-    for line in diff_lines(raw_diff(repo_dir, "-U0", "origin/%s...HEAD" % base, "--", path)):
-        # Only lines after the first @@ are content: a removed `--extra-index-url` line starts with `---`.
-        if line.startswith("@@"):
-            in_hunk = True
-        elif in_hunk and line[:1] in "+-":
-            # pip splits a file with str.splitlines(), which breaks at more than git's newline, so a
-            # comment that git sees running to the end of the line may end early for pip.
-            for piece in line[1:].splitlines() or [""]:
-                text = re.sub(r"--hash[= ]\S+", "", re.sub(r"(?:^|\s)#.*$", "", piece))
-                if PIP_OPTION.search(text.strip()):
-                    out.append(line)
-                    break
-    return out
+PIP_COMMENT = re.compile(r"(^|\s+)#.*$")
+# An option (-e, -r, --index-url, ...) or anything that names a source other than the index: a direct
+# reference (`name @ url`), a URL or a path.
+PIP_SOURCE = re.compile(r"(?:^|\s)-|@|://|/|\\")
+
+
+def pip_logical_lines(text):
+    """The requirement lines pip sees: split with str.splitlines() (which breaks at more than git's
+    newline), backslash continuations joined the way pip joins them, comments removed, and `--hash` pins
+    dropped."""
+    out, joined = [], []
+    for line in text.splitlines():
+        if not line.endswith("\\") or PIP_COMMENT.match(line):
+            if PIP_COMMENT.match(line):
+                line = " " + line
+            out.append("".join(joined + [line]))
+            joined = []
+        else:
+            joined.append(line.strip("\\"))
+    if joined:
+        out.append("".join(joined))
+    return [re.sub(r"--hash[= ]\S+", "", PIP_COMMENT.sub("", l)).strip() for l in out]
+
+
+def pip_sources_changed(repo_dir, base, path):
+    """True when the requirement lines that are pip options or name a source other than the index differ
+    between the base and the branch. Whole logical lines are compared, not diff lines: a trailing backslash
+    joins the next line, so a changed line can alter an unchanged one. `--hash` pins on their own
+    continuation lines are not sources."""
+    def risky(rev):
+        text = blob(repo_dir, rev, path)
+        return None if text is None else sorted(l for l in pip_logical_lines(text) if PIP_SOURCE.search(l))
+    old, new = risky("origin/" + base), risky("HEAD")
+    return new is None or (old or []) != new
 
 
 def dependency_only(repo_dir, base, paths):
@@ -1601,7 +1632,7 @@ def dependency_only(repo_dir, base, paths):
         name = os.path.basename(path)
         if name in LOCKFILES and name not in CODE_LOCKFILES:
             if name == "requirements.txt" and (not plain_requirements(repo_dir, base, path)
-                                               or pip_option_lines(repo_dir, base, path)):
+                                               or pip_sources_changed(repo_dir, base, path)):
                 return False
             continue
         if name not in MANIFEST_CHECKS:
