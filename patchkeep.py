@@ -25,6 +25,7 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -1709,6 +1710,19 @@ def npm_lock(text):
             out.setdefault(("dependencies", prefix + name), []).append(entry)
             if isinstance(entry, dict) and "dependencies" in entry:
                 stack.append((prefix + name + "/node_modules/", entry["dependencies"]))
+    # npm resolves each path to a folder, so `./node_modules/x`, `node_modules/x/` or a case or Unicode variant
+    # (one folder on macOS) would be a second entry for one folder, and the later one wins. Only one spelling
+    # per folder is read.
+    seen = set()
+    for section, path in out:
+        if section == "shape":
+            continue
+        if path and (posixpath.normpath(path) != path or path.startswith("/") or "\\" in path):
+            raise ValueError("a package path npm would rewrite")
+        folder = (section, unicodedata.normalize("NFC", path).casefold())
+        if folder in seen:
+            raise ValueError("two package paths for one folder")
+        seen.add(folder)
     return out
 
 

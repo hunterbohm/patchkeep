@@ -818,6 +818,11 @@ class DependencyOnly(Branch):
         git_x_y_bumped["packages"]["node_modules/y"] = {"version": "1.0.1", "resolved": "https://registry.npmjs.org/y/-/y-1.0.1.tgz"}
         git_x, git_x_swapped, git_x_y_bumped = (json.dumps(d, indent=2) + "\n" for d in (git_x, git_x_swapped, git_x_y_bumped))
         git_crate = 'source = "git+https://github.com/e/x#abc"\n'
+        second_path = json.loads(git_x)
+        second_path["packages"]["./node_modules/x"] = {"name": "x", "version": "1.2.3", "resolved": tarball.replace("4", "3")}
+        case_variant = json.loads(npm)
+        case_variant["packages"]["node_modules/X"] = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/X/-/X-1.0.0.tgz"}
+        second_path, case_variant = json.dumps(second_path, indent=2) + "\n", json.dumps(case_variant, indent=2) + "\n"
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -863,6 +868,8 @@ class DependencyOnly(Branch):
              zdep("1.1", '{version = ">=1.1", markers = "python_version >= \'3.9\'"}'), True),
             ("package-lock.json", "a git entry swapped for a registry release", git_x, git_x_swapped, False),
             ("package-lock.json", "a git entry kept while another package is bumped", git_x, git_x_y_bumped, True),
+            ("package-lock.json", "a second path for the same folder", git_x, second_path, False),
+            ("package-lock.json", "two paths that differ only in case", npm_base, case_variant, False),
             ("uv.lock", "a git source swapped for the registry", uv("1.0", '{ git = "https://github.com/e/x?rev=1#abc" }'),
              uv("1.0", reg), False),
             ("Cargo.lock", "a git crate swapped for a registry release", cargo("1.0.0", git_crate), cargo("1.0.0"), False),
