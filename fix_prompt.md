@@ -20,7 +20,8 @@ These come from cve.now (matched against this repo's exact lockfile versions) an
    - No unrelated upgrades, no refactors, no formatting churn. Change code only when a bump forces it.
    - A finding with no patched version anywhere: leave it and list it under `remaining` with the reason.
    - A fix that needs a major-version jump: make it only if build and tests still pass with no code changes or a small, clearly mechanical one. Otherwise leave it in `remaining` with the reason.
-   - This copy has no `.git` folder, so git commands will not work here. Do not leave build output, caches, or tool folders behind: when you finish, only the files you meant to change may differ from the original (node_modules and virtualenvs are ignored).
+   - This copy has no `.git` folder, so git commands will not work here. Do not leave build output, caches, or tool folders behind: when you finish, only the files you meant to change may differ from the original (node_modules and virtualenvs are ignored). Write scratch files under `$TMPDIR`, not `/tmp`.
+   - The trusted side stops the whole run, and nothing is pushed, if your copy has any git metadata (a `.git` folder or file in any spelling), a changed `.gitattributes`, `.gitmodules` or `.lfsconfig`, a new or changed symbolic link, a changed file under `.github/`, or a changed file whose name has a quote, backslash or control character in it. A dependency fix needs none of these.
 3. Verify. Rerun the same install, build, and tests. Everything that passed in step 1 must still pass. Confirm each fixed package now resolves only to patched versions (`pnpm why <pkg>`, `npm ls <pkg>`, `uv tree --package <pkg>`, etc.).
 4. Write the result as JSON to `{{RESULT_FILE}}`, as your last action:
    ```
