@@ -808,6 +808,16 @@ class DependencyOnly(Branch):
         zdep = lambda version, spec: poetry(version, '\n[package.dependencies]\nz = %s\n' % spec) + '\n[[package]]\nname = "z"\nversion = "1.0"\n'
         crate = lambda name, version: '[[package]]\nname = "%s"\nversion = "%s"\n%s\n' % (name, version, crates)
         needs_fb = '[[package]]\nname = "app"\nversion = "0.1.0"\ndependencies = ["foo-bar 1.0.0"]\n\n'
+        git_x = json.loads(npm_base)
+        git_x["packages"][""]["dependencies"] = {"x": "github:e/x#main", "y": "^1.0.0"}
+        git_x["packages"]["node_modules/x"] = {"version": "1.2.3", "resolved": "git+ssh://git@github.com/e/x.git#abc"}
+        git_x["packages"]["node_modules/y"] = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/y/-/y-1.0.0.tgz"}
+        git_x_swapped = json.loads(json.dumps(git_x))
+        git_x_swapped["packages"]["node_modules/x"] = {"version": "1.2.3", "resolved": tarball.replace("4", "3")}
+        git_x_y_bumped = json.loads(json.dumps(git_x))
+        git_x_y_bumped["packages"]["node_modules/y"] = {"version": "1.0.1", "resolved": "https://registry.npmjs.org/y/-/y-1.0.1.tgz"}
+        git_x, git_x_swapped, git_x_y_bumped = (json.dumps(d, indent=2) + "\n" for d in (git_x, git_x_swapped, git_x_y_bumped))
+        git_crate = 'source = "git+https://github.com/e/x#abc"\n'
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -851,6 +861,13 @@ class DependencyOnly(Branch):
             ("poetry.lock", "a dependency turned into a local path", zdep("1.0", '">=1"'), zdep("1.1", '{path = "../z"}'), False),
             ("poetry.lock", "a dependency range and marker changed", zdep("1.0", '">=1"'),
              zdep("1.1", '{version = ">=1.1", markers = "python_version >= \'3.9\'"}'), True),
+            ("package-lock.json", "a git entry swapped for a registry release", git_x, git_x_swapped, False),
+            ("package-lock.json", "a git entry kept while another package is bumped", git_x, git_x_y_bumped, True),
+            ("uv.lock", "a git source swapped for the registry", uv("1.0", '{ git = "https://github.com/e/x?rev=1#abc" }'),
+             uv("1.0", reg), False),
+            ("Cargo.lock", "a git crate swapped for a registry release", cargo("1.0.0", git_crate), cargo("1.0.0"), False),
+            ("Cargo.lock", "a git crate kept while a registry crate is bumped",
+             cargo("1.0.0", git_crate).replace('"x"', '"g"') + "\n" + cargo("1.0.0"), cargo("1.0.0", git_crate).replace('"x"', '"g"') + "\n" + cargo("1.0.1"), True),
             ("Cargo.lock", "a dependency matched only by a look-alike name",
              needs_fb + crate("foo-bar", "1.0.0") + crate("foo_bar", "1.0.0"), needs_fb + crate("foo-bar", "1.0.1") + crate("foo_bar", "1.0.0"), False),
             ("uv.lock", "registry bump", uv("1.0", reg), uv("1.1", reg, 'sdist = { url = "https://files.pythonhosted.org/x-1.1.tar.gz", '

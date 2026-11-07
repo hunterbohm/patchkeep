@@ -1855,6 +1855,9 @@ def lock_ok(name, old_text, new_text):
     """True when the lockfile `name` may merge without CI, from its text in the base (None when it is new)
     and on the branch (None when it is deleted). Every package in it is a registry release, or installs from
     the same place as a package under the same key in the base (for uv, its files as well as its source).
+    Every package of the base that is not a registry release is still there from that same place: the
+    manifest asks for that source, so a registry entry in its stead is not used, and the install fetches
+    the source afresh.
     And it still holds everything an install needs (npm_complete, toml_complete): an install resolves anything
     missing afresh, past these checks, the same way it would with the lockfile deleted. Whether a locked
     version is inside the range asked for is left to the release-age rule and the review: that takes each
@@ -1872,6 +1875,11 @@ def lock_ok(name, old_text, new_text):
             before = old.get(key, [])
             for p in packages:
                 if not registry(p) and not any(same(source(p), source(b)) for b in before):
+                    return False
+        for key, packages in old.items():
+            after = new.get(key, [])
+            for b in packages:
+                if not registry(b) and not any(same(source(p), source(b)) for p in after):
                     return False
     except (ValueError, TypeError, AttributeError, RecursionError):
         return False
