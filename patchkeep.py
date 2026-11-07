@@ -21,10 +21,13 @@ Kill switches in the state dir (default ~/.local/state/patchkeep):
 import base64
 import fnmatch
 import datetime
+import contextlib
+import ctypes
 import fcntl
 import hashlib
 import json
 import os
+import platform
 import posixpath
 import re
 import shlex
@@ -117,12 +120,167 @@ def kill_group(pgid):
         pass
 
 
-def run_in_own_group(cmd, timeout, cwd, stdin, environ):
+# A writer round's leftovers. kill_group ends what stayed in the round's session, but a process can start a
+# session of its own and leave it. On Linux this process adopts every orphan of the round
+# (PR_SET_CHILD_SUBREAPER), so all of them stay below it. On macOS an orphan goes to launchd, so the round's
+# processes are found by their sandbox instead: sandbox_check asks the kernel what a process's sandbox allows.
+PR_SET_CHILD_SUBREAPER = 36
+SANDBOX_FILTER_PATH = 1
+_SANDBOX_CHECK = []
+
+
+def _signal(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _proc_tree():
+    """{parent pid: [(pid, state)]} for every process, from /proc."""
+    tree = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name, "rb") as f:
+                # The command name is in parentheses and may hold anything; the fields follow the last ")".
+                fields = f.read().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        tree.setdefault(int(fields[1]), []).append((int(name), fields[0]))
+    return tree
+
+
+def _descendants():
+    """(pid, state) of every process below this one."""
+    tree, found, todo = _proc_tree(), [], [os.getpid()]
+    while todo:
+        for pid, state in tree.get(todo.pop(), ()):
+            found.append((pid, state))
+            todo.append(pid)
+    return found
+
+
+def _live_descendants():
+    return [pid for pid, state in _descendants() if state != b"Z"]
+
+
+def _reap_children():
+    for pid, _ in _proc_tree().get(os.getpid(), ()):
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def _subreaper(on):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, int(on), 0, 0, 0) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, "prctl(PR_SET_CHILD_SUBREAPER): " + os.strerror(err))
+
+
+def _sandbox_check():
+    if not _SANDBOX_CHECK:
+        fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib").sandbox_check
+        fn.restype = ctypes.c_int
+        # Only the fixed arguments: the path is a variadic argument, which arm64 macOS passes on the stack,
+        # and ctypes passes an argument past argtypes that way.
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _SANDBOX_CHECK.append(fn)
+    return _SANDBOX_CHECK[0]
+
+
+def _sandboxed_writers(writes, mark):
+    """This user's live processes whose sandbox lets them write in `writes` but not `mark`, a file made beside
+    it for this check: the writer's sandbox, and no other process on the machine."""
+    check = _sandbox_check()
+    out = subprocess.run(["ps", "-U", str(os.getuid()), "-o", "pid=,stat="], capture_output=True, text=True,
+                         timeout=60).stdout
+    found = []
+    for row in out.splitlines():
+        cols = row.split()
+        if len(cols) != 2 or cols[1].startswith("Z") or int(cols[0]) == os.getpid():
+            continue
+        pid = int(cols[0])
+        if check(pid, None, 0) == 1 and check(pid, b"file-write-data", SANDBOX_FILTER_PATH, writes.encode()) == 0 \
+                and check(pid, b"file-write-data", SANDBOX_FILTER_PATH, mark.encode()) == 1:
+            found.append(pid)
+    return found
+
+
+def _kill_all(members, after_kill=lambda: None, passes=50):
+    """SIGKILL every process members() returns. Each is stopped first and the list read again until no new
+    one shows up, so none can start another between being found and being killed; then all are killed and
+    the list is read again, until it is empty. A pid is kept only if members() still returns it once it is
+    stopped: a stopped process can't exit, so its pid can't have gone to an unrelated process since.
+    Raises when processes are still there after `passes` reads."""
+    stopped = set()
+    for _ in range(passes):
+        found = [pid for pid in members() if pid not in stopped]
+        if found:
+            for pid in found:
+                _signal(pid, signal.SIGSTOP)
+            still = set(members())
+            for pid in found:
+                if pid in still:
+                    stopped.add(pid)
+                else:
+                    _signal(pid, signal.SIGCONT)
+            continue
+        if not stopped:
+            return
+        for pid in stopped:
+            _signal(pid, signal.SIGKILL)
+        stopped = set()
+        time.sleep(0.02)
+        after_kill()
+    raise RuntimeError("the writer left processes that could not be killed")
+
+
+@contextlib.contextmanager
+def _leftovers_killed(writes):
+    """Around one writer round whose OS sandbox lets it write only in `writes`: when the round ends, kill
+    every process it left, including one that started a session of its own. On Linux that is every process
+    below this one, so the caller must have nothing else running."""
+    system = platform.system()
+    if not writes or system not in ("Linux", "Darwin"):
+        yield
+        return
+    if system == "Linux":
+        _subreaper(True)
+        try:
+            yield
+        finally:
+            try:
+                _kill_all(_live_descendants, _reap_children)
+                for _ in range(50):
+                    if not _descendants():
+                        break
+                    _reap_children()
+                    time.sleep(0.02)
+            finally:
+                _subreaper(False)
+        return
+    fd, mark = tempfile.mkstemp(prefix=".patchkeep-mark-", dir=os.path.dirname(writes))
+    os.close(fd)
+    try:
+        yield
+    finally:
+        try:
+            _kill_all(lambda: _sandboxed_writers(writes, mark))
+        finally:
+            os.remove(mark)
+
+
+def run_in_own_group(cmd, timeout, cwd, stdin, environ, writes=None):
     """Run the untrusted writer in its own session, and SIGKILL everything it left in that session when it
     exits or times out, so no easy background child outlives the round and swaps a file or folder while
     the trusted side reads it. Output goes to files, not pipes: a leftover child holding a pipe would keep
-    the read open until the timeout. A process that starts a session of its own gets away, so the checks
-    that follow do not rely on this alone. Returns the last 1 MB of each stream."""
+    the read open until the timeout. A process that starts a session of its own leaves that session; with
+    `writes`, the one folder the writer's sandbox lets it write, those are killed too (_leftovers_killed).
+    Returns the last 1 MB of each stream."""
     def tail(f, limit=1_000_000):
         f.seek(0, os.SEEK_END)
         f.seek(max(0, f.tell() - limit))
@@ -131,24 +289,25 @@ def run_in_own_group(cmd, timeout, cwd, stdin, environ):
     with tempfile.TemporaryFile() as fin, tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
         fin.write((stdin or "").encode())
         fin.seek(0)
-        try:
-            p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, cwd=cwd, env=environ, start_new_session=True)
-        except FileNotFoundError as ex:
-            return 127, "", str(ex)
-        try:
-            rc = p.wait(timeout)
-        except subprocess.TimeoutExpired:
-            kill_group(p.pid)
-            p.wait()
-            return 124, "", "timeout"
-        finally:
-            kill_group(p.pid)
+        with _leftovers_killed(writes):
+            try:
+                p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, cwd=cwd, env=environ, start_new_session=True)
+            except FileNotFoundError as ex:
+                return 127, "", str(ex)
+            try:
+                rc = p.wait(timeout)
+            except subprocess.TimeoutExpired:
+                kill_group(p.pid)
+                p.wait()
+                return 124, "", "timeout"
+            finally:
+                kill_group(p.pid)
         return rc, tail(fout), tail(ferr)
 
 
-def run(cmd, timeout=120, cwd=None, stdin=None, environ=None, own_group=False):
+def run(cmd, timeout=120, cwd=None, stdin=None, environ=None, own_group=False, writes=None):
     if own_group:
-        return run_in_own_group(cmd, timeout, cwd, stdin, environ or env())
+        return run_in_own_group(cmd, timeout, cwd, stdin, environ or env(), writes)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
                            env=environ or env(), input=stdin)
@@ -1321,7 +1480,8 @@ def discard_work(work, trusted_root):
 def author(work, work_fd, work_id, agent_dir, prompt, result_name):
     """Run the fixer agent in Codex's OS sandbox. It sees a plain copy of the repo with no .git, can write
     only under the work dir, and every read or write under the real HOME is denied, so GitHub and git
-    credentials and the trusted checkout are unreachable. Network stays on for package installs.
+    credentials and the trusted checkout are unreachable. Its network reaches public hosts for package
+    installs, through Codex's own proxy, and nothing local.
     `work` is the path made once at the start and `work_fd` an open handle on it: everything the trusted
     side does inside the folder goes through the handle, which a link put at the path later cannot
     redirect. Returns its result JSON."""
@@ -1340,13 +1500,18 @@ def author(work, work_fd, work_id, agent_dir, prompt, result_name):
     # ":slash_tmp" is read-only because the default work_root is /tmp, where the reviewer's folder (its
     # verdict is read back from there) and other runs' folders live. The writer's own temp files go to
     # TMPDIR, inside `work`, which --add-dir makes writable.
+    # The network goes through Codex's own proxy (features.network_proxy), which lets commands reach public
+    # hosts and nothing local. Without it the commands could reach any Unix socket and localhost: through
+    # a terminal multiplexer's socket (macOS) or the user's service manager over D-Bus (Linux) a command ran
+    # a program outside the sandbox that wrote under $HOME (tested with Codex 0.163 and 0.166).
     rc, so, se = run(["codex", "exec", "-m", CFG["fix"]["author_model"], "-c", "model_reasoning_effort=" + CFG["fix"]["author_effort"],
                       "-c", 'default_permissions="vulnfix"',
                       "-c", 'permissions.vulnfix.extends=":workspace"',
                       "-c", 'permissions.vulnfix.filesystem={"%s"="deny",":slash_tmp"="read"}' % HOME,
-                      "-c", "permissions.vulnfix.network.enabled=true",
+                      "-c", "permissions.vulnfix.network.enabled=true", "-c", "features.network_proxy=true",
+                      "-c", 'permissions.vulnfix.network.domains={"*"="allow"}',
                       "--add-dir", work, "--skip-git-repo-check", "-C", agent_dir, "-"],
-                     FIX_TIMEOUT, cwd=agent_dir, stdin=prompt, environ=environ, own_group=True)
+                     FIX_TIMEOUT, cwd=agent_dir, stdin=prompt, environ=environ, own_group=True, writes=work)
     print(so[-20000:], se[-5000:], flush=True)
     check_work(work, work_id)
     res = read_agent_result(work_fd, result_name)

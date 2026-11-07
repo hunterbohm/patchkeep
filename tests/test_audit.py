@@ -1099,6 +1099,16 @@ class WriterProfile(Flow):
         self.assertEqual(seen["tmp"], seen["work"] + "/tmp")
         self.assertEqual(seen["home"], seen["work"] + "/home")
         self.assertTrue(seen["tmp_is_dir"])
+        self.assertEqual(kw.get("writes"), seen["work"], "the round's leftovers are found and killed")
+
+    def test_the_writers_commands_reach_public_hosts_through_codexs_proxy(self):
+        self.writers = [bump]
+        self.fix()
+        cmd, _ = self.codex_cmds[0]
+        for arg in ("features.network_proxy=true", 'permissions.vulnfix.network.domains={"*"="allow"}',
+                    "permissions.vulnfix.network.enabled=true"):
+            self.assertIn(arg, cmd)
+        self.assertFalse(any("unix_sockets" in a or "allow_local_binding" in a for a in cmd))
 
     def test_every_writer_round_runs_in_its_own_process_group(self):
         self.verdicts = ["1. a.js:1 bad", "AGREE"]
@@ -1155,6 +1165,80 @@ class LeftoverProcesses(unittest.TestCase):
 
     def test_a_missing_program_is_a_failed_round_not_a_crash(self):
         self.assertEqual(V.run(["no-such-writer-program"], 5, own_group=True)[0], 127)
+
+
+# A shell line that leaves a process in a session of its own, whose parent has exited, and waits until it
+# has written its pid to the file.
+ESCAPE = ("%s -c 'import os, sys, time\nif os.fork(): os._exit(0)\nos.setsid()\nif os.fork(): os._exit(0)\n"
+          "open(sys.argv[1] + \".new\", \"w\").write(str(os.getpid())); os.rename(sys.argv[1] + \".new\", sys.argv[1])\n"
+          "time.sleep(300)\n' PIDFILE </dev/null >/dev/null 2>&1; while [ ! -s PIDFILE ]; do sleep 0.05; done" % sys.executable)
+
+
+def running(pid):
+    """True while the process runs; a zombie waiting to be reaped counts as gone."""
+    p = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return p.returncode == 0 and not p.stdout.strip().startswith("Z")
+
+
+def ends(pid, seconds=5):
+    end = time.time() + seconds
+    while time.time() < end and running(pid):
+        time.sleep(0.05)
+    return not running(pid)
+
+
+class EscapedWriterProcesses(unittest.TestCase):
+    """A process that starts a session of its own leaves the round's session, so killing that session
+    misses it. With `writes`, the round still kills it."""
+
+    def setUp(self):
+        self.work = self.folder()
+
+    def folder(self):
+        d = os.path.realpath(tempfile.mkdtemp(prefix="pkesc-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+    def command(self, script, work):
+        """On macOS, under a sandbox that lets the command write only in `work`, as the writer's does."""
+        if sys.platform == "darwin":
+            profile = '(version 1)(allow default)(deny file-write*)(allow file-write* (subpath "%s") (literal "/dev/null"))'
+            return ["sandbox-exec", "-p", profile % work, "sh", "-c", script]
+        return ["sh", "-c", script]
+
+    def escape(self, name, then="", timeout=60, writes=True, work=None):
+        work = work or self.work
+        pidfile = os.path.join(work, name)
+        out = V.run(self.command(ESCAPE.replace("PIDFILE", pidfile) + then, work), timeout, own_group=True,
+                    writes=work if writes else None)
+        pid = int(read(pidfile))
+        self.addCleanup(lambda: running(pid) and os.kill(pid, signal.SIGKILL))
+        return out, pid
+
+    def test_a_process_in_a_session_of_its_own_is_killed_when_the_round_ends(self):
+        (rc, _, _), pid = self.escape("pid")
+        self.assertEqual(rc, 0)
+        self.assertTrue(ends(pid), "the process that left the round's session is still running")
+
+    def test_it_is_killed_when_the_round_times_out_too(self):
+        (rc, _, err), pid = self.escape("pid", then="; sleep 300", timeout=3)
+        self.assertEqual((rc, err), (124, "timeout"))
+        self.assertTrue(ends(pid))
+
+    def test_killing_the_session_alone_misses_it(self):
+        _, pid = self.escape("pid", writes=False)
+        self.assertTrue(running(pid))
+
+    def test_a_process_of_another_round_is_left_alone(self):
+        _, pid = self.escape("pid", writes=False, work=self.folder())
+        _, mine = self.escape("mine")
+        self.assertTrue(ends(mine))
+        self.assertTrue(running(pid), "a process the round did not start was killed")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux adopts the round's orphans")
+    def test_nothing_is_left_below_this_process(self):
+        self.escape("pid", then="; sleep 300 & sleep 300 &")
+        self.assertEqual(V._descendants(), [])
 
 
 class ReadAgentResult(unittest.TestCase):
