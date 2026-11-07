@@ -781,7 +781,13 @@ class DependencyOnly(Branch):
                                "node_modules/a": {"resolved": "packages/a", "link": True}})
         ws_new_link = json.loads(json.dumps(ws))
         ws_new_link["packages"]["node_modules/b"] = {"resolved": "packages/a", "link": True}
+        ws_script = json.loads(json.dumps(ws))
+        ws_script["packages"]["packages/a"]["scripts"] = {"preinstall": "evil"}
         ws, ws_new_link = json.dumps(ws, indent=2) + "\n", json.dumps(ws_new_link, indent=2) + "\n"
+        ws_script = json.dumps(ws_script, indent=2) + "\n"
+        npm_script = json.loads(npm)
+        npm_script["packages"]["node_modules/x"]["scripts"] = {"preinstall": "evil"}
+        npm_script = json.dumps(npm_script, indent=2) + "\n"
         reg = '{ registry = "https://pypi.org/simple" }'
         uv = lambda version, source, extra="": '[[package]]\nname = "x"\nversion = "%s"\nsource = %s\n%s' % (version, source, extra)
         app = '[[package]]\nname = "app"\nversion = "0.1.0"\nsource = { editable = "." }\ndependencies = [{ name = "x" }]\n'
@@ -802,6 +808,8 @@ class DependencyOnly(Branch):
              v1({"version": "1.2.3", "resolved": tarball.replace("4", "3")}), v1({"version": "github:e/x#abc"}), False),
             ("package-lock.json", "a workspace link kept", ws, ws.replace("1.2.3", "1.2.4"), True),
             ("package-lock.json", "a new workspace link", ws, ws_new_link, False),
+            ("package-lock.json", "an install script on a registry entry", npm.replace("1.2.4", "1.2.3"), npm_script, False),
+            ("package-lock.json", "an install script on a kept workspace entry", ws, ws_script, False),
             ("package-lock.json", "deleted", LOCK, None, False),
             ("uv.lock", "registry bump", uv("1.0", reg), uv("1.1", reg, 'sdist = { url = "https://files.pythonhosted.org/x-1.1.tar.gz", '
                                                                       'hash = "sha256:a", size = 1 }\n'), True),

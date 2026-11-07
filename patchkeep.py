@@ -1658,7 +1658,16 @@ def pip_sources_changed(repo_dir, base, path):
 RELEASE_HOSTS = REGISTRY_HOSTS - {"github.com", "codeload.github.com"}
 CRATES_IO = {"registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"}
 SEMVER = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?")
-NPM_SOURCE_KEYS = ("name", "version", "resolved", "link", "from")
+# What a registry entry of a package lock may hold. npm keeps an entry's fields in its tree, and some
+# others, such as `scripts`, it would run on install.
+NPM_REGISTRY_KEYS = {"name", "version", "resolved", "integrity", "dev", "optional", "devOptional", "peer",
+                     "license", "engines", "bin", "funding", "cpu", "os", "libc", "hasInstallScript",
+                     "hasShrinkwrap", "deprecated", "dependencies", "optionalDependencies", "peerDependencies",
+                     "peerDependenciesMeta", "bundleDependencies", "requires", "workspaces"}
+# The dependency ranges an entry lists (and v1's nested entries, checked on their own). An entry that is
+# not a registry release must keep everything else it had in the base.
+NPM_RANGE_KEYS = {"dependencies", "devDependencies", "optionalDependencies", "peerDependencies",
+                  "peerDependenciesMeta", "requires"}
 UV_FILE_KEYS = {"url", "hash", "size", "upload-time"}
 
 
@@ -1690,13 +1699,12 @@ def npm_lock(text):
 
 
 def npm_registry(entry):
-    return (isinstance(entry, dict) and "link" not in entry and "from" not in entry
-            and release_url(entry.get("resolved"))
+    return (isinstance(entry, dict) and set(entry) <= NPM_REGISTRY_KEYS and release_url(entry.get("resolved"))
             and isinstance(entry.get("version"), str) and bool(SEMVER.fullmatch(entry["version"])))
 
 
 def npm_source(entry):
-    return {k: entry.get(k) for k in NPM_SOURCE_KEYS} if isinstance(entry, dict) else entry
+    return {k: v for k, v in entry.items() if k not in NPM_RANGE_KEYS} if isinstance(entry, dict) else entry
 
 
 def toml_packages(text):
