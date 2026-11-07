@@ -6,9 +6,13 @@ import atexit
 import json
 import os
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import warnings
 from contextlib import ExitStack
@@ -169,11 +173,15 @@ class CopyBase(Branch):
 
     def setUp(self):
         super().setUp()
-        self.agent, self.holding = self.tmp + "/agent", self.tmp + "/holding"
+        self.work = self.tmp + "/work"
+        os.makedirs(self.work)
+        self.agent, self.holding = self.work + "/repo", self.tmp + "/holding"
+        self.work_fd = os.open(self.work, V.OPEN_DIR)
+        self.addCleanup(os.close, self.work_fd)
         V.sync_tree(self.repo, self.agent)
 
     def collect(self):
-        return V.collect_agent_copy(self.agent, self.holding, self.repo)
+        return V.collect_agent_copy(self.work_fd, "repo", self.holding, self.repo)
 
 
 class GitMetadata(CopyBase):
@@ -381,7 +389,7 @@ class Flow(unittest.TestCase):
         if cmd[0] == "gh":
             return self.gh(cmd)
         if cmd[0] == "codex":
-            self.codex_cmds.append(cmd)
+            self.codex_cmds.append((cmd, kw))
             return self.sandbox(cwd, environ)
         return REAL_RUN(cmd, timeout, cwd, stdin, environ, **kw)
 
@@ -412,7 +420,11 @@ class Flow(unittest.TestCase):
             return 0, json.dumps({"files": [{"path": n} for n in names if n][:100]}), ""
         return 1, "", "unexpected gh call: %s" % cmd
 
+    def clone_agent(self):
+        return self.agent_dir_seen
+
     def sandbox(self, cwd, environ):
+        self.agent_dir_seen = cwd
         self.writer_environs.append(environ)
         ctx = Ctx(cwd, environ)
         writer = self.writers[self.round]
@@ -855,6 +867,404 @@ class ForeignHosts(unittest.TestCase):
         self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org@evil.example/x.tgz"'),
                          ["registry.npmjs.org@evil.example"])
         self.assertEqual(self.hosts('"resolved": "https://registry.npmjs.org:8080/x.tgz"'), ["registry.npmjs.org:8080"])
+
+
+def no_hang(case, seconds=30):
+    """Fail the test, instead of hanging the run, when it blocks: a named pipe read without care waits forever."""
+    timer = threading.Timer(seconds, lambda: os.kill(os.getpid(), signal.SIGALRM))
+    previous = signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(AssertionError("blocked on a named pipe")))
+    timer.start()
+
+    def stop():
+        timer.cancel()
+        signal.signal(signal.SIGALRM, previous)
+    case.addCleanup(stop)
+
+
+class WriterProfile(Flow):
+    def test_the_writer_cannot_write_to_slash_tmp_or_read_home_and_gets_a_temp_dir_of_its_own(self):
+        seen = {}
+
+        def writer(ctx):
+            seen.update(tmp=ctx.environ["TMPDIR"], home=ctx.environ["HOME"], work=ctx.work,
+                        tmp_is_dir=os.path.isdir(ctx.environ["TMPDIR"]) and not os.path.islink(ctx.environ["TMPDIR"]))
+            bump(ctx)
+        self.writers = [writer]
+        self.assertEqual(self.fix()["status"], "merged")
+        cmd, kw = self.codex_cmds[0]
+        self.assertIn('permissions.vulnfix.filesystem={"%s"="deny",":slash_tmp"="read"}' % V.HOME, cmd)
+        self.assertIn('permissions.vulnfix.extends=":workspace"', cmd)
+        self.assertEqual(cmd[cmd.index("--add-dir") + 1], seen["work"])
+        self.assertEqual(seen["tmp"], seen["work"] + "/tmp")
+        self.assertEqual(seen["home"], seen["work"] + "/home")
+        self.assertTrue(seen["tmp_is_dir"])
+
+    def test_every_writer_round_runs_in_its_own_process_group(self):
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [bump, idle]
+        self.fix()
+        self.assertEqual([kw.get("own_group") for _, kw in self.codex_cmds], [True, True])
+
+
+class LeftoverProcesses(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vwleft-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def wait_dead(self, pid, seconds=5):
+        end = time.time() + seconds
+        while time.time() < end and self.alive(pid):
+            time.sleep(0.05)
+        return not self.alive(pid)
+
+    def child_pid(self, script, timeout=30):
+        out = V.run(["sh", "-c", script], timeout, cwd=self.tmp, own_group=True)
+        return out, int(read(self.tmp + "/pid").strip())
+
+    def test_a_background_child_is_gone_after_the_writer_exits(self):
+        _, pid = self.child_pid("sleep 60 & echo $! > pid")
+        self.assertTrue(self.wait_dead(pid))
+
+    def test_a_background_child_is_gone_after_the_writer_times_out(self):
+        rc, _, err = V.run(["sh", "-c", "sleep 60 & echo $! > pid; sleep 60"], 1, cwd=self.tmp, own_group=True)
+        self.assertEqual((rc, err), (124, "timeout"))
+        self.assertTrue(self.wait_dead(int(read(self.tmp + "/pid").strip())))
+
+    def test_a_child_that_holds_the_output_open_does_not_hold_the_round(self):
+        start = time.time()
+        (rc, out, _), pid = self.child_pid("(sleep 60; echo late) & echo $! > pid; echo first")
+        self.assertLess(time.time() - start, 20)
+        self.assertEqual((rc, out), (0, "first\n"))
+        self.assertTrue(self.wait_dead(pid))
+
+    def test_the_prompt_reaches_the_writer_and_its_output_comes_back(self):
+        rc, out, err = V.run(["sh", "-c", "cat; echo oops >&2; exit 3"], 30, stdin="the prompt", own_group=True)
+        self.assertEqual((rc, out, err), (3, "the prompt", "oops\n"))
+
+    def test_a_missing_program_is_a_failed_round_not_a_crash(self):
+        self.assertEqual(V.run(["no-such-writer-program"], 5, own_group=True)[0], 127)
+
+
+class ReadAgentResult(unittest.TestCase):
+    def setUp(self):
+        no_hang(self)
+        self.tmp = tempfile.mkdtemp(prefix="vwres-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.fd = os.open(self.tmp, V.OPEN_DIR)
+        self.addCleanup(os.close, self.fd)
+
+    def test_a_plain_result_is_read(self):
+        put(self.tmp, {"r.json": '{"status": "changes"}'})
+        self.assertEqual(V.read_agent_result(self.fd, "r.json"), {"status": "changes"})
+
+    def test_a_link_is_not_followed(self):
+        secret = tempfile.mkdtemp(prefix="vwsecret-")
+        self.addCleanup(shutil.rmtree, secret, ignore_errors=True)
+        put(secret, {"s.json": '{"status": "changes", "leak": true}'})
+        os.symlink(secret + "/s.json", self.tmp + "/r.json")
+        self.assertIsNone(V.read_agent_result(self.fd, "r.json"))
+
+    def test_a_named_pipe_gives_no_result_and_no_hang(self):
+        os.mkfifo(self.tmp + "/r.json")
+        self.assertIsNone(V.read_agent_result(self.fd, "r.json"))
+
+    def test_a_folder_missing_files_bad_json_and_non_objects_give_none(self):
+        os.mkdir(self.tmp + "/r.json")
+        self.assertIsNone(V.read_agent_result(self.fd, "r.json"))
+        self.assertIsNone(V.read_agent_result(self.fd, "missing.json"))
+        for text in ("{", "[1]", "null", '"x"'):
+            put(self.tmp, {"b.json": text})
+            self.assertIsNone(V.read_agent_result(self.fd, "b.json"), text)
+
+    def test_the_read_goes_through_the_handle_not_the_path(self):
+        put(self.tmp, {"r.json": '{"status": "nofix"}'})
+        moved = self.tmp + "-moved"
+        os.rename(self.tmp, moved)
+        self.addCleanup(shutil.rmtree, moved, ignore_errors=True)
+        os.mkdir(self.tmp)
+        put(self.tmp, {"r.json": '{"status": "changes"}'})
+        self.assertEqual(V.read_agent_result(self.fd, "r.json"), {"status": "nofix"})
+
+
+class WritesThroughLinks(Flow):
+    def setUp(self):
+        super().setUp()
+        no_hang(self)
+        self.outside = self.tmp + "/outside"
+        os.makedirs(self.outside)
+
+    def test_home_turned_into_a_link_between_rounds_is_not_written_through(self):
+        homes = []
+
+        def link_home(ctx):
+            bump(ctx)
+            shutil.rmtree(ctx.work + "/home")
+            os.symlink(self.outside, ctx.work + "/home")
+
+        def second(ctx):
+            homes.append((os.path.islink(ctx.work + "/home"), os.path.isdir(ctx.work + "/home")))
+            put(ctx.agent_dir, {"src/index.js": "console.log(2)\n"})
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [link_home, second]
+        self.assertEqual(self.fix()["status"], "merged")
+        self.assertEqual(homes, [(False, True)])
+        self.assertEqual(os.listdir(self.outside), [])
+
+    def test_tmp_turned_into_a_link_is_replaced_by_a_real_folder(self):
+        seen = []
+
+        def link_tmp(ctx):
+            bump(ctx)
+            shutil.rmtree(ctx.work + "/tmp")
+            os.symlink(self.outside, ctx.work + "/tmp")
+
+        def second(ctx):
+            seen.append(os.path.islink(ctx.work + "/tmp"))
+            put(ctx.agent_dir, {"src/index.js": "console.log(2)\n"})
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [link_tmp, second]
+        self.assertEqual(self.fix()["status"], "merged")
+        self.assertEqual(seen, [False])
+
+    def test_a_result_file_that_is_a_link_is_not_read(self):
+        secret = self.tmp + "/secret.json"
+        put(self.tmp, {"secret.json": json.dumps(dict(RESULT, pr_title="LEAKED"))})
+
+        def writer(ctx):
+            bump(ctx)
+            os.symlink(secret, ctx.work + "/result.json")
+            return False
+        self.writers = [writer]
+        res = self.fix()
+        self.assertEqual(res["status"], "error", res["text"])
+        self.assertIn("wrote no result", res["text"])
+        self.assertEqual(self.pushed_branches(), [])
+
+    def test_a_result_file_that_is_a_named_pipe_is_no_result_and_no_hang(self):
+        def writer(ctx):
+            bump(ctx)
+            os.mkfifo(ctx.work + "/result.json")
+            return False
+        self.writers = [writer]
+        self.assertIn("wrote no result", self.fix()["text"])
+
+    def test_a_result_file_left_by_the_last_round_is_not_taken_for_this_rounds(self):
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [bump, lambda c: False]
+        res = self.fix()
+        self.assertIn("wrote no result", res["text"])
+        self.assertEqual(self.pushed_branches(), [])
+
+    def test_a_result_file_turned_into_a_folder_between_rounds_is_cleared_for_the_next_round(self):
+        def review_then_swap(body, diff, history):
+            work = os.path.dirname(self.clone_agent())
+            os.remove(work + "/result.json")
+            os.makedirs(work + "/result.json/sub")
+            put(work + "/result.json/sub", {"x": "y"})
+            return self.fake_review(body, diff, history)
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [bump, lambda c: put(c.agent_dir, {"src/index.js": "console.log(2)\n"})]
+        with mock.patch.object(V, "sol_review", review_then_swap):
+            res = self.fix()
+        self.assertEqual(res["status"], "merged", res["text"])
+
+
+class ReplacedWorkFolder(Flow):
+    def setUp(self):
+        super().setUp()
+        self.outside = self.tmp + "/outside"
+        os.makedirs(self.outside)
+        put(self.outside, {"keep.txt": "mine\n"})
+
+    def swap_for_link(self, ctx):
+        os.rename(ctx.work, ctx.work + "-gone")
+        os.symlink(self.outside, ctx.work)
+        self.addCleanup(shutil.rmtree, ctx.work + "-gone", ignore_errors=True)
+
+    def test_a_work_folder_turned_into_a_link_before_the_copy_is_collected_is_refused(self):
+        def writer(ctx):
+            bump(ctx)
+            self.swap_for_link(ctx)
+            return False
+        self.writers = [writer]
+        self.assertNotPushed(self.fix(), "the writer replaced its work folder")
+        self.assertEqual(os.listdir(self.outside), ["keep.txt"])
+        self.assertEqual(read(self.outside + "/keep.txt"), "mine\n")
+
+    def test_a_work_folder_turned_into_a_link_between_rounds_is_not_written_into(self):
+        def second(ctx):
+            self.swap_for_link(ctx)
+            return False
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [bump, second]
+        self.assertNotPushed(self.fix(), "the writer replaced its work folder")
+        self.assertEqual(os.listdir(self.outside), ["keep.txt"])
+
+    def test_a_work_folder_swapped_for_another_folder_between_rounds_is_not_used(self):
+        def second(ctx):
+            os.rename(ctx.work, ctx.work + "-gone")
+            self.addCleanup(shutil.rmtree, ctx.work + "-gone", ignore_errors=True)
+            os.makedirs(ctx.work + "/repo")
+            put(ctx.work, {"result.json": json.dumps(RESULT)})
+            return False
+        self.verdicts = ["1. a.js:1 bad", "AGREE"]
+        self.writers = [bump, second]
+        self.assertNotPushed(self.fix(), "the writer replaced its work folder")
+
+    def test_an_agent_copy_turned_into_a_link_is_refused(self):
+        def writer(ctx):
+            bump(ctx)
+            shutil.rmtree(ctx.agent_dir)
+            os.symlink(self.outside, ctx.agent_dir)
+        self.writers = [writer]
+        self.assertNotPushed(self.fix(), "the writer replaced its copy of the repo with a link or a file")
+        self.assertEqual(read(self.outside + "/keep.txt"), "mine\n")
+
+    def test_the_agent_copy_rename_goes_through_the_handle(self):
+        work = self.tmp + "/w"
+        os.makedirs(work + "/repo")
+        put(work + "/repo", {"a.txt": "a\n"})
+        fd = os.open(work, V.OPEN_DIR)
+        self.addCleanup(os.close, fd)
+        trusted = self.tmp + "/t"
+        os.makedirs(trusted)
+        sh("git", "init", "-q", cwd=trusted)
+        os.rename(work, work + "-moved")
+        os.symlink(self.outside, work)
+        self.assertEqual(V.collect_agent_copy(fd, "repo", self.tmp + "/h", trusted), [])
+        self.assertEqual(read(trusted + "/a.txt"), "a\n")
+        self.assertTrue(os.path.isdir(work + "-moved/repo"))
+        self.assertEqual(os.listdir(self.outside), ["keep.txt"])
+
+
+class NamedPipes(Flow):
+    seed = dict(SEED, **{".gitattributes": "* text=auto\n"})
+
+    def setUp(self):
+        super().setUp()
+        no_hang(self)
+
+    def test_a_named_pipe_in_place_of_a_git_settings_file_is_refused_without_hanging(self):
+        def writer(ctx):
+            bump(ctx)
+            os.remove(ctx.agent_dir + "/.gitattributes")
+            os.mkfifo(ctx.agent_dir + "/.gitattributes")
+        self.writers = [writer]
+        self.assertNotPushed(self.fix(), "the writer changed git settings (.gitattributes)")
+
+    def test_a_named_pipe_among_the_files_is_not_copied_and_does_not_hang(self):
+        self.writers = [bump_then(lambda c: os.mkfifo(c.agent_dir + "/notes.pipe"))]
+        self.assertEqual(self.fix()["status"], "merged")
+        self.assertFalse(os.path.exists(self.clone + "/notes.pipe"))
+
+
+class Cleanup(Flow):
+    def setUp(self):
+        super().setUp()
+        self.outside = self.tmp + "/outside"
+        os.makedirs(self.outside)
+        put(self.outside, {"keep.txt": "mine\n"})
+        os.chmod(self.outside + "/keep.txt", 0o444)
+
+    def test_links_and_locked_files_in_the_work_folder_are_removed_without_touching_their_targets(self):
+        def writer(ctx):
+            bump(ctx)
+            os.symlink(self.outside, ctx.work + "/escape")
+            os.symlink(self.outside + "/keep.txt", ctx.work + "/escape-file")
+            put(ctx.work + "/cache/deep", {"f": "x\n"})
+            os.chmod(ctx.work + "/cache/deep/f", 0o400)
+            os.chmod(ctx.work + "/cache/deep", 0o500)
+            os.chmod(ctx.work + "/cache", 0o500)
+        self.writers = [writer]
+        res = self.fix()
+        self.assertEqual(res["status"], "merged", res["text"])
+        self.assertEqual(sorted(os.listdir(self.outside)), ["keep.txt"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.outside + "/keep.txt").st_mode), 0o444)
+        self.assertEqual(os.listdir(V.WORK_ROOT), [])
+        self.assertEqual(os.listdir(V.STATE_DIR + "/trusted"), [])
+
+    def test_the_work_folder_has_left_its_path_before_the_delete_starts(self):
+        seen = []
+        real = V.rmtree_force
+
+        def spy(path):
+            if path.endswith("/work-discarded"):
+                seen.append(os.listdir(V.WORK_ROOT))
+            real(path)
+        with mock.patch.object(V, "rmtree_force", spy):
+            self.fix()
+        self.assertEqual(seen, [[]])
+
+    def test_a_link_in_place_of_the_work_folder_is_removed_as_a_link(self):
+        def writer(ctx):
+            bump(ctx)
+            os.rename(ctx.work, ctx.work + "-gone")
+            os.symlink(self.outside, ctx.work)
+            self.addCleanup(shutil.rmtree, ctx.work + "-gone", ignore_errors=True)
+            return False
+        self.writers = [writer]
+        self.fix()
+        self.assertEqual(os.listdir(self.outside), ["keep.txt"])
+        self.assertEqual([n for n in os.listdir(V.WORK_ROOT) if not n.endswith("-gone")], [])
+
+    def test_when_the_move_fails_the_folder_is_left_and_not_deleted_through_its_path(self):
+        real = os.rename
+
+        def failing(src, dst, **kw):
+            if str(dst).endswith("/work-discarded"):
+                raise OSError("cross-device")
+            return real(src, dst, **kw)
+        with mock.patch.object(V.os, "rename", failing):
+            self.fix()
+        self.assertEqual(len(os.listdir(V.WORK_ROOT)), 1)
+        self.assertEqual(os.listdir(V.STATE_DIR + "/trusted"), [])
+
+
+class RmtreeForce(unittest.TestCase):
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="vwrm-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_read_only_folders_and_files_are_removed(self):
+        put(self.tmp, {"t/a/b/f": "x\n", "t/a/g": "y\n"})
+        for d in ("t/a/b", "t/a", "t"):
+            os.chmod(self.tmp + "/" + d, 0o500)
+        os.chmod(self.tmp + "/t/a/b/f", 0o400)
+        V.rmtree_force(self.tmp + "/t")
+        self.assertFalse(os.path.lexists(self.tmp + "/t"))
+        os.chmod(self.tmp, 0o700)
+
+    def test_links_to_locked_targets_are_neither_followed_nor_changed(self):
+        put(self.tmp, {"target/f": "x\n", "t/keep": "k\n"})
+        os.chmod(self.tmp + "/target", 0o500)
+        os.symlink(self.tmp + "/target", self.tmp + "/t/link")
+        os.symlink(self.tmp + "/target/f", self.tmp + "/t/filelink")
+        V.rmtree_force(self.tmp + "/t")
+        self.assertFalse(os.path.lexists(self.tmp + "/t"))
+        self.assertEqual(stat.S_IMODE(os.stat(self.tmp + "/target").st_mode), 0o500)
+        self.assertTrue(os.path.exists(self.tmp + "/target/f"))
+        os.chmod(self.tmp + "/target", 0o700)
+
+    def test_a_link_given_as_the_path_is_removed_and_its_target_kept(self):
+        put(self.tmp, {"target/f": "x\n"})
+        os.symlink(self.tmp + "/target", self.tmp + "/l")
+        V.rmtree_force(self.tmp + "/l")
+        self.assertFalse(os.path.lexists(self.tmp + "/l"))
+        self.assertTrue(os.path.exists(self.tmp + "/target/f"))
+
+    def test_a_missing_path_is_fine(self):
+        V.rmtree_force(self.tmp + "/nothing")
 
 
 ODD_BREAKS = ["\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]

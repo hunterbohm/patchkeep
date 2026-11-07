@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -105,7 +106,47 @@ def env(**extra):
     return dict(os.environ, PATH=PATH_ENV, GH_PROMPT_DISABLED="1", **extra)
 
 
-def run(cmd, timeout=120, cwd=None, stdin=None, environ=None):
+def kill_group(pgid):
+    """SIGKILL every process in the group. Nothing left is not an error; a group of only zombies can
+    answer "not permitted" on macOS."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_in_own_group(cmd, timeout, cwd, stdin, environ):
+    """Run the untrusted writer in its own session, and SIGKILL everything it left in that session when it
+    exits or times out, so no easy background child outlives the round and swaps a file or folder while
+    the trusted side reads it. Output goes to files, not pipes: a leftover child holding a pipe would keep
+    the read open until the timeout. A process that starts a session of its own gets away, so the checks
+    that follow do not rely on this alone. Returns the last 1 MB of each stream."""
+    def tail(f, limit=1_000_000):
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - limit))
+        return f.read().decode("utf-8", "replace")
+
+    with tempfile.TemporaryFile() as fin, tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
+        fin.write((stdin or "").encode())
+        fin.seek(0)
+        try:
+            p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, cwd=cwd, env=environ, start_new_session=True)
+        except FileNotFoundError as ex:
+            return 127, "", str(ex)
+        try:
+            rc = p.wait(timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(p.pid)
+            p.wait()
+            return 124, "", "timeout"
+        finally:
+            kill_group(p.pid)
+        return rc, tail(fout), tail(ferr)
+
+
+def run(cmd, timeout=120, cwd=None, stdin=None, environ=None, own_group=False):
+    if own_group:
+        return run_in_own_group(cmd, timeout, cwd, stdin, environ or env())
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
                            env=environ or env(), input=stdin)
@@ -930,7 +971,7 @@ def copy_problems(copy, trusted):
 def snapshot_tree(src, dst):
     """A private, complete copy of src for checking. Unlike sync_tree it keeps git-named entries so
     copy_problems can see them, and it starts from nothing each time."""
-    shutil.rmtree(dst, ignore_errors=True)
+    rmtree_force(dst)
     os.makedirs(dst)
     cmd = ["rsync", "-a", "--no-specials", "--no-devices"]
     for e in DIR_EXCLUDES:
@@ -938,58 +979,222 @@ def snapshot_tree(src, dst):
     must(cmd + [src.rstrip("/") + "/", dst.rstrip("/") + "/"], 900)
 
 
-def collect_agent_copy(agent_dir, holding, trusted):
-    """Move the agent's copy under HOME (which the sandbox cannot touch) before reading it, so a leftover
-    process cannot swap it for a symlink mid-sync. A process that kept a handle on the folder can still
-    change it after the move, so it is copied once into a snapshot nothing else holds, and that snapshot
-    is what gets checked and then mirrored onto the trusted checkout. The agent's copy goes back for the
-    next round. Returns copy_problems(); with any, nothing was synced."""
+def collect_agent_copy(work_fd, agent_name, holding, trusted):
+    """Move the agent's copy (`agent_name`, inside the folder `work_fd` is open on) under HOME, which the
+    sandbox cannot touch, before reading it, so a leftover process cannot swap it for a symlink mid-sync.
+    A process that kept a handle on the folder can still change it after the move, so it is copied once
+    into a snapshot nothing else holds, and that snapshot is what gets checked and then mirrored onto the
+    trusted checkout. The agent's copy goes back for the next round. Both moves go through the work
+    folder's handle, so a work path the writer has since pointed elsewhere cannot make them touch another
+    folder. Returns copy_problems(); with any, nothing was synced."""
     snapshot = holding + "-snapshot"
     try:
-        os.rename(agent_dir, holding)
+        os.rename(agent_name, holding, src_dir_fd=work_fd)
     except OSError as ex:
         raise RuntimeError("cannot move the agent copy into the state dir (%s). Set work_root to a "
                            "folder outside $HOME on the same filesystem as state_dir." % ex)
     try:
         if os.path.islink(holding) or not os.path.isdir(holding):
-            raise RuntimeError("agent copy is not a plain directory; refusing to read it")
+            raise WriterRefused("replaced its copy of the repo with a link or a file")
         snapshot_tree(holding, snapshot)
     finally:
-        os.rename(holding, agent_dir)
+        os.rename(holding, agent_name, dst_dir_fd=work_fd)
     try:
         problems = copy_problems(snapshot, trusted)
         if not problems:
             sync_tree(snapshot, trusted)
     finally:
-        shutil.rmtree(snapshot, ignore_errors=True)
+        rmtree_force(snapshot)
     return problems
 
 
-def author(work, agent_dir, prompt, result_file):
-    """Run the fixer agent in Codex's OS sandbox. It sees a plain copy of the repo with no .git,
-    can write only under the work dir in /tmp, and every read or write under the real HOME is
-    denied, so GitHub and git credentials and the trusted checkout are unreachable. Network stays
-    on for package installs. Returns its result JSON."""
+OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def open_private_dir(parent_fd, name):
+    """A handle on the folder `name` inside the folder `parent_fd` is open on, made if it is missing. A
+    link or plain file the writer put in its place is removed, never followed. Every step goes through the
+    parent handle, so renaming or relinking the parent's path afterwards changes nothing here."""
+    try:
+        return os.open(name, OPEN_DIR, dir_fd=parent_fd)
+    except OSError:
+        try:
+            found = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            found = None
+        if found and stat.S_ISDIR(found.st_mode):
+            raise
+        if found:
+            os.unlink(name, dir_fd=parent_fd)
+    os.mkdir(name, 0o755, dir_fd=parent_fd)
+    return os.open(name, OPEN_DIR, dir_fd=parent_fd)
+
+
+def read_agent_result(dir_fd, name):
+    """The writer's result JSON in the folder `dir_fd` is open on, or None. The file sits where the agent
+    can write, so a link there must not make this process read a file under HOME and a named pipe must not
+    make it wait forever: only a regular file is opened, and without blocking."""
+    try:
+        if not stat.S_ISREG(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+            return None
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return None
+    with os.fdopen(fd) as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None
+        try:
+            res = json.loads(f.read(2_000_000))
+        except ValueError:
+            return None
+    return res if isinstance(res, dict) else None
+
+
+def work_identity(work_fd):
+    st = os.fstat(work_fd)
+    return st.st_dev, st.st_ino
+
+
+def check_work(work, identity):
+    """The work folder must still be the folder made for this run, or the writer's results are not to be
+    trusted. This only tells the run to stop. What the trusted side does inside the folder goes through the
+    handle, because a path checked here can be swapped a moment later."""
+    try:
+        st = os.lstat(work)
+    except OSError:
+        st = None
+    if st is None or not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != identity:
+        raise WriterRefused("replaced its work folder")
+
+
+def _chmod_nofollow(name, dir_fd, mode):
+    """chmod `name` in the folder `dir_fd` unless it is a link. Linux has no no-follow chmod, so the file is
+    opened as an O_PATH handle (which is the link itself, when it is one) and changed through that."""
+    if os.chmod in os.supports_follow_symlinks:
+        os.chmod(name, mode, dir_fd=dir_fd, follow_symlinks=False)
+    elif hasattr(os, "O_PATH"):
+        fd = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=dir_fd)
+        try:
+            if not stat.S_ISLNK(os.fstat(fd).st_mode):
+                os.chmod("/proc/self/fd/%d" % fd, mode)
+        finally:
+            os.close(fd)
+
+
+def _unlock(name, dir_fd, st):
+    """Make `name` (in the folder `dir_fd`, last seen as `st`) deletable: clear its file flags (macOS `uchg`)
+    and give a folder owner access. Never acts on a link or on a link's target."""
+    if stat.S_ISLNK(st.st_mode):
+        return
+    if getattr(st, "st_flags", 0) and hasattr(os, "chflags") and os.chflags in os.supports_follow_symlinks:
+        # chflags takes no folder handle, so the process steps into the folder to name the file alone.
+        here = os.open(".", os.O_RDONLY)
+        try:
+            os.fchdir(dir_fd)
+            os.chflags(name, 0, follow_symlinks=False)
+        except OSError:
+            pass
+        finally:
+            os.fchdir(here)
+            os.close(here)
+    if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+        _chmod_nofollow(name, dir_fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+
+
+def _remove(name, dir_fd):
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    _unlock(name, dir_fd, st)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(name, dir_fd=dir_fd)
+        return
+    try:
+        fd = os.open(name, OPEN_DIR, dir_fd=dir_fd)
+    except OSError:
+        os.unlink(name, dir_fd=dir_fd)    # swapped for a link since it was looked at: drop the link
+        return
+    try:
+        if not os.path.samestat(os.fstat(fd), st):
+            return
+        for entry in os.listdir(fd):
+            try:
+                _remove(entry, fd)
+            except (OSError, RecursionError):
+                pass
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=dir_fd)
+
+
+def rmtree_force(path):
+    """Remove a folder tree, including one with read-only folders or immutable files (test runs leave
+    those behind: Go's module cache has no writable folder). Every step names an entry inside a folder
+    that is already open, so a process that swaps a folder for a link while this runs cannot make it
+    change or delete anything outside the tree. Links are removed and never followed. What cannot be
+    removed is left."""
+    parent, name = os.path.split(os.path.abspath(path))
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        _remove(name, dir_fd)
+    except (OSError, RecursionError):
+        pass    # missing, or nested deeper than the stack or the open-file limit allows: left, not fatal
+    finally:
+        os.close(dir_fd)
+
+
+def discard_work(work, trusted_root):
+    """Delete the work folder. The writer can still change it, and a process it left running can swap a
+    folder in it for a link at any moment. So it is first renamed into the trusted root, which the sandbox
+    cannot touch (the same move collect_agent_copy makes), and deleted there. When it can't be moved it
+    stays: deleting it through a path the writer can change is worse than leaving it."""
+    moved = os.path.join(trusted_root, "work-discarded")
+    try:
+        os.rename(work, moved)
+    except FileNotFoundError:
+        return
+    except OSError as ex:
+        log("left %s in place, cannot move it out of the writer's reach: %s" % (work, ex))
+        return
+    rmtree_force(moved)
+
+
+def author(work, work_fd, work_id, agent_dir, prompt, result_name):
+    """Run the fixer agent in Codex's OS sandbox. It sees a plain copy of the repo with no .git, can write
+    only under the work dir, and every read or write under the real HOME is denied, so GitHub and git
+    credentials and the trusted checkout are unreachable. Network stays on for package installs.
+    `work` is the path made once at the start and `work_fd` an open handle on it: everything the trusted
+    side does inside the folder goes through the handle, which a link put at the path later cannot
+    redirect. Returns its result JSON."""
+    check_work(work, work_id)
+    try:
+        _remove(result_name, work_fd)
+    except FileNotFoundError:
+        pass
+    os.close(open_private_dir(work_fd, "home"))
+    os.close(open_private_dir(work_fd, "tmp"))
     home = work + "/home"
-    os.makedirs(home, exist_ok=True)
-    if os.path.exists(result_file):
-        os.remove(result_file)
     environ = env(HOME=home, CODEX_HOME=HOME + "/.codex", XDG_CACHE_HOME=home + "/.cache",
-                  GIT_CONFIG_GLOBAL="/dev/null", GH_CONFIG_DIR=home + "/gh")
+                  GIT_CONFIG_GLOBAL="/dev/null", GH_CONFIG_DIR=home + "/gh", TMPDIR=work + "/tmp")
     for k in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
         environ.pop(k, None)
+    # ":slash_tmp" is read-only because the default work_root is /tmp, where the reviewer's folder (its
+    # verdict is read back from there) and other runs' folders live. The writer's own temp files go to
+    # TMPDIR, inside `work`, which --add-dir makes writable.
     rc, so, se = run(["codex", "exec", "-m", CFG["fix"]["author_model"], "-c", "model_reasoning_effort=" + CFG["fix"]["author_effort"],
                       "-c", 'default_permissions="vulnfix"',
                       "-c", 'permissions.vulnfix.extends=":workspace"',
-                      "-c", 'permissions.vulnfix.filesystem={"%s"="deny"}' % HOME,
+                      "-c", 'permissions.vulnfix.filesystem={"%s"="deny",":slash_tmp"="read"}' % HOME,
                       "-c", "permissions.vulnfix.network.enabled=true",
                       "--add-dir", work, "--skip-git-repo-check", "-C", agent_dir, "-"],
-                     FIX_TIMEOUT, cwd=agent_dir, stdin=prompt, environ=environ)
+                     FIX_TIMEOUT, cwd=agent_dir, stdin=prompt, environ=environ, own_group=True)
     print(so[-20000:], se[-5000:], flush=True)
-    try:
-        return json.load(open(result_file))
-    except (OSError, ValueError):
+    check_work(work, work_id)
+    res = read_agent_result(work_fd, result_name)
+    if res is None:
         raise RuntimeError("fixer agent wrote no result (rc=%s)" % rc)
+    return res
 
 
 def pr_workflows(repo_dir):
@@ -1438,12 +1643,20 @@ def fix(repo, items_path):
     items = json.load(open(items_path))
     sh = set_hash(items)
     short = repo.split("/", 1)[1]
-    work = tempfile.mkdtemp(prefix="vulnwatch-%s-" % short, dir=WORK_ROOT)
+    # Resolved once: every later path under the work folder is built from this one, and the folder is told
+    # apart from a look-alike by its device and inode, not by its name.
+    work = os.path.realpath(tempfile.mkdtemp(prefix="vulnwatch-%s-" % short, dir=WORK_ROOT))
+    # Kept for the whole run: what the trusted side does inside the folder goes through this handle, which
+    # a link put at the path later cannot redirect.
+    work_fd = os.open(work, OPEN_DIR)
+    work_id = work_identity(work_fd)
     os.makedirs(STATE_DIR + "/trusted", exist_ok=True)
     trusted_root = tempfile.mkdtemp(prefix=slug(repo) + "-", dir=STATE_DIR + "/trusted")
     trusted = trusted_root + "/repo"
-    agent_dir = work + "/repo"
-    result_file = work + "/result.json"
+    agent_name = "repo"
+    agent_dir = work + "/" + agent_name
+    result_name = "result.json"
+    result_file = work + "/" + result_name
 
     outcome = []
 
@@ -1454,7 +1667,8 @@ def fix(repo, items_path):
         result("blocked", "Fix for %s was not pushed: %s." % (short, why), **kw)
 
     def copy_ok():
-        problems = collect_agent_copy(agent_dir, holding, trusted)
+        check_work(work, work_id)
+        problems = collect_agent_copy(work_fd, agent_name, holding, trusted)
         if problems:
             refuse("the writer " + "; ".join(p[:140] for p in problems[:3]))
         return not problems
@@ -1471,7 +1685,7 @@ def fix(repo, items_path):
         prompt = template.replace("{{REPO}}", repo).replace("{{RESULT_FILE}}", result_file) \
             .replace("{{FINDINGS}}", json.dumps(items, indent=1))
         holding = trusted_root + "/agent-copy"
-        res = author(work, agent_dir, prompt, result_file)
+        res = author(work, work_fd, work_id, agent_dir, prompt, result_name)
         if not copy_ok():
             return
         if res.get("status") != "changes" or not git(trusted, "status", "--porcelain").strip():
@@ -1504,9 +1718,9 @@ def fix(repo, items_path):
             log("%s review round %d on %s: %s" % (repo, rnd, sha[:10], "AGREE" if agree else "findings"))
             if agree or rnd == REVIEW_ROUNDS:
                 break
-            res = author(work, agent_dir, prompt + "\n\n## Reviewer findings (round %d)\n\n%s\n\n"
+            res = author(work, work_fd, work_id, agent_dir, prompt + "\n\n## Reviewer findings (round %d)\n\n%s\n\n"
                          "Fix each finding or rebut it with evidence. Then rewrite the result file, with `response` "
-                         "listing what you did for each finding." % (rnd, verdict), result_file)
+                         "listing what you did for each finding." % (rnd, verdict), result_name)
             if not copy_ok():
                 return
             history = "Previous review findings:\n%s\n\nAuthor's response:\n%s\n\n" % (verdict, res.get("response", ""))
@@ -1540,11 +1754,14 @@ def fix(repo, items_path):
         result("merged" if not after.startswith(" It broke") else "reverted",
                "Fixed and merged %s: %s.%s %s%s" % (short, pkg_list(res.get("fixed")) or "dependency updates", tail, url, after),
                pr=url, sha=sha, detail=res)
+    except WriterRefused as ex:
+        refuse("the writer " + str(ex))
     except Exception as ex:
         result("error", "Auto-fix for %s hit an error: %s" % (short, str(ex)[:200]))
     finally:
-        shutil.rmtree(work, ignore_errors=True)
-        shutil.rmtree(trusted_root, ignore_errors=True)
+        os.close(work_fd)
+        discard_work(work, trusted_root)
+        rmtree_force(trusted_root)
         # Published only after cleanup: done_command may close the window this runs in.
         os.makedirs(RESULTS_DIR, exist_ok=True)
         for res in outcome:
