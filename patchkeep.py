@@ -1597,6 +1597,8 @@ def plain_requirements(repo_dir, base, path):
 
 
 PIP_COMMENT = re.compile(r"(^|\s+)#.*$")
+# A --hash option: only where pip starts an option, at a word start, never text inside a file name.
+PIP_HASH = re.compile(r"(?:^|(?<=\s))--hash[= ]\S+")
 # An option (-e, -r, --index-url, ...) or anything that names a source other than the index: a direct
 # reference (`name @ url`), a URL or a path.
 PIP_SOURCE = re.compile(r"(?:^|\s)-|@|://|/|\\")
@@ -1630,7 +1632,7 @@ def pip_logical_lines(text):
             joined.append(line.strip("\\"))
     if joined:
         out.append("".join(joined))
-    return [re.sub(r"--hash[= ]\S+", "", PIP_COMMENT.sub("", l)).strip() for l in out]
+    return [PIP_HASH.sub(" ", PIP_COMMENT.sub("", l)).strip() for l in out]
 
 
 def pip_sources_changed(repo_dir, base, path):
