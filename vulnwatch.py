@@ -759,6 +759,42 @@ REGISTRY_HOSTS = {"registry.npmjs.org", "registry.yarnpkg.com", "files.pythonhos
                   "repo.hex.pm", "github.com", "codeload.github.com"}
 
 
+def link_problems(repo_dir, base):
+    """Paths whose new version on the branch is a symbolic link, from `git diff --raw`. A dependency fix
+    never needs one, and the trusted side opens changed lockfiles, so a link planted by the writer could
+    make it read a file under $HOME."""
+    out = []
+    for line in diff_lines(raw_diff(repo_dir, "--raw", "origin/%s...HEAD" % base)):
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if len(fields) >= 2 and fields[1] == "120000":
+            out.append(path)
+    return out
+
+
+# CI runs a pushed branch with the repo's secrets, and a workflow or local action the writer edited is
+# what it would run. A dependency fix never needs to touch them, so any edit there is refused. Matched
+# without regard to case: the writer's disk may not tell `.GitHub` from `.github`.
+CI_PATH = re.compile(r"^\.github/(workflows|actions)/", re.I)
+
+
+def branch_problem(repo_dir, base):
+    """Why the local commit must not be pushed, in words, or None. Everything here runs before any push,
+    because CI would run the pushed branch. Quoted names come first: a diff header with one is not parsed
+    by the checks below."""
+    paths = changed_paths(repo_dir, base)
+    quoted = quoted_names(paths)
+    if quoted:
+        return "it adds or changes a file whose name git has to quote (%s)" % ", ".join(repr(p) for p in quoted[:3])
+    links = link_problems(repo_dir, base)
+    if links:
+        return "it adds or changes a symbolic link (%s)" % ", ".join(links[:3])
+    ci = [p for p in paths if CI_PATH.match(p)]
+    if ci:
+        return "it edits CI files (%s)" % ", ".join(ci[:3])
+    return None
+
+
 def split_diff(diff):
     sections, cur = [], None
     for line in diff_lines(diff):
@@ -1037,13 +1073,17 @@ def close_stale_auto_prs(repo):
                  "--comment", "Superseded by a newer vulnwatch run."], 60)
 
 
-def commit_and_push(trusted, branch, title):
+def commit_local(trusted, title):
+    """Commit whatever the writer changed. Nothing leaves this machine. Returns the commit sha."""
     if git(trusted, "status", "--porcelain").strip():
         git(trusted, "add", "-A")
         git(trusted, "-c", "user.name=" + CFG["fix"]["git_name"], "-c", "user.email=" + CFG["fix"]["git_email"], "commit", "-q",
             "-m", title)
-    git(trusted, "push", "-q", "-u", "origin", branch, timeout=600)
     return git(trusted, "rev-parse", "HEAD").strip()
+
+
+def push_branch(trusted, branch):
+    git(trusted, "push", "-q", "-u", "origin", branch, timeout=600)
 
 
 def merge_pinned(repo, pr, sha):
@@ -1137,11 +1177,13 @@ def fix(repo, items_path):
     def result(status, text, **kw):
         outcome.append(dict(kw, repo=repo, status=status, set=sh, items=items_path, text=text))
 
+    def refuse(why, **kw):
+        result("blocked", "Fix for %s was not pushed: %s." % (short, why), **kw)
+
     def copy_ok():
         problems = collect_agent_copy(agent_dir, holding, trusted)
         if problems:
-            result("blocked", "Fix for %s was not pushed: the writer %s." % (
-                short, "; ".join(p[:140] for p in problems[:3])))
+            refuse("the writer " + "; ".join(p[:140] for p in problems[:3]))
         return not problems
 
     try:
@@ -1164,28 +1206,27 @@ def fix(repo, items_path):
             result(status, "Couldn't auto-fix %s: %s" % (short, (res.get("notes") or "no changes made")[:220]), detail=res)
             return
 
-        close_stale_auto_prs(repo)
-        pr, url, history, agree, verdict, sha = None, None, "", False, "", None
+        title = res.get("pr_title") or "security: dependency fixes"
+        history, agree, verdict, sha = "", False, "", None
+        # Nothing is pushed until every local check and the review have passed on the commit, because CI
+        # runs a pushed branch with the repo's secrets.
         for rnd in range(1, REVIEW_ROUNDS + 1):
             if killed("DISABLE_AUTOFIX"):
-                result("blocked", "Auto-fix for %s stopped by the kill switch." % short, pr=url)
+                refuse("stopped by the kill switch")
                 return
-            sha = commit_and_push(trusted, branch, res.get("pr_title") or "security: dependency fixes")
-            body = (res.get("pr_body") or "") + "\n\nAutomated by vulnwatch."
-            if pr is None:
-                url = must(["gh", "pr", "create", "-R", repo, "--base", base, "--head", branch,
-                            "--title", res.get("pr_title") or "security: dependency fixes", "--body", body], 120, trusted).strip()
-                pr = int(url.rstrip("/").rsplit("/", 1)[-1])
-            else:
-                run(["gh", "pr", "edit", str(pr), "-R", repo, "--body", body], 60)
+            sha = commit_local(trusted, title)
+            why = branch_problem(trusted, base)
+            if why:
+                refuse(why)
+                return
             diff, foreign = review_diff(trusted, base)
             if diff is None:
-                result("blocked", "Fix for %s is too large to review in full, so it's not merged: %s" % (short, url), pr=url)
+                refuse("it is too large to review in full")
                 return
             if foreign:
-                result("blocked", "Fix for %s pulls packages from unexpected hosts (%s), so it's not merged: %s" % (
-                    short, ", ".join(foreign[:3]), url), pr=url)
+                refuse("it pulls packages from unexpected hosts (%s)" % ", ".join(foreign[:3]))
                 return
+            body = (res.get("pr_body") or "") + "\n\nAutomated by vulnwatch."
             agree, verdict = sol_review(body, diff, history)
             log("%s review round %d on %s: %s" % (repo, rnd, sha[:10], "AGREE" if agree else "findings"))
             if agree or rnd == REVIEW_ROUNDS:
@@ -1196,13 +1237,23 @@ def fix(repo, items_path):
             if not copy_ok():
                 return
             history = "Previous review findings:\n%s\n\nAuthor's response:\n%s\n\n" % (verdict, res.get("response", ""))
+        if not agree:
+            refuse("the reviewer still had findings after %d rounds" % REVIEW_ROUNDS, verdict=verdict[:4000])
+            return
+        if killed("DISABLE_AUTOFIX"):
+            refuse("stopped by the kill switch")
+            return
 
+        # Every check passed. Only now does anything leave this machine.
+        close_stale_auto_prs(repo)
+        push_branch(trusted, branch)
+        url = must(["gh", "pr", "create", "-R", repo, "--base", base, "--head", branch,
+                    "--title", title, "--body", body], 120, trusted).strip()
+        pr = int(url.rstrip("/").rsplit("/", 1)[-1])
         files = json.loads(must(["gh", "pr", "view", str(pr), "-R", repo, "--json", "files"], 60))["files"]
         dep_only = all(is_dep_file(f["path"]) for f in files)
         checks = checks_state(repo, sha, required_ci)
         reasons = []
-        if not agree:
-            reasons.append("reviewer still had findings after %d rounds" % REVIEW_ROUNDS)
         if checks in ("fail", "error"):
             reasons.append("CI %s" % ("failed" if checks == "fail" else "status unknown"))
         if checks == "none" and not dep_only:
