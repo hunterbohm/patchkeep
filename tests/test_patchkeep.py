@@ -3,9 +3,9 @@ import sys
 import tempfile
 import unittest
 
-os.environ["VULNWATCH_CONFIG"] = os.path.join(tempfile.mkdtemp(), "missing.toml")
+os.environ["PATCHKEEP_CONFIG"] = os.path.join(tempfile.mkdtemp(), "missing.toml")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import vulnwatch as v  # noqa: E402
+import patchkeep as v  # noqa: E402
 
 
 def finding(**kw):
