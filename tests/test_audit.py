@@ -1655,6 +1655,19 @@ class LockfileSources(Branch):
                       "      (See the y docs, version 2.)\n\n  y@1.0.0:\n    resolution: {integrity: sha512-BBBB}\n"
                       "    deprecated: Please upgrade!\n")
         reg_x = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/x/-/x-1.0.0.tgz"}
+        # Yarn and pnpm read by indentation alone, so a file moved right installs the same.
+        shift = lambda text: "".join("  " + l if l.strip() else l for l in text.splitlines(True))
+        yarn_x = yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz"
+        not_named = lambda entry, name="yarn.lock": "%s in %s (not the registry release it names)" % (entry, name)
+        berry_res = lambda res: '"x@npm:^1.0.0":\n  version: 1.0.0\n  resolution: "%s"\n' % res
+        odd_y = '\ny@^1.0.0:\n  version "1.0.0"\n  resolved "y/-/y-1.0.0.tgz"\n'
+        pnpm_x = pnpm % "{integrity: sha512-AAAA}"
+        pnpm_block = ("lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      integrity: sha512-AAAA\n"
+                      "      tarball: evil/-/evil-1.0.0.tgz\n")
+        pnpm_dep = lambda spec, version, extra="": ("lockfileVersion: '9.0'\n\n%simporters:\n\n  .:\n    dependencies:\n"
+                                                    "      x:\n        specifier: %s\n        version: %s\n" % (extra, spec, version))
+        catalog = "catalogs:\n  default:\n    x:\n      specifier: npm:y@^1.0.0\n      version: 1.0.0\n\n"
+        alias = "x in pnpm-lock.yaml (an alias its specifier does not name)"
         rows = [
             ("package-lock.json", "a registry bump", npm(), bump, []),
             ("package-lock.json", "a URL behind JSON escapes", npm(), npm("https://evil.example/x.tgz").replace(
@@ -1693,7 +1706,7 @@ class LockfileSources(Branch):
              ["a line pnpm does not write in pnpm-lock.yaml", "evil.example"]),
             ("pnpm-lock.yaml", "a binary tag", pnpm % "{integrity: sha512-AAAA}",
              pnpm % "{tarball: !!binary aHR0cHM6Ly9ldmlsLmV4YW1wbGUveC50Z3o=}",
-             ["a line pnpm does not write in pnpm-lock.yaml"]),
+             ["a line pnpm does not write in pnpm-lock.yaml", not_named("x@1.0.0", "pnpm-lock.yaml")]),
             ("mix.lock", "a hex bump", mix % '"1.0.0"', mix % '"1.0.1"', []),
             ("mix.lock", "code in mix.lock", mix % '"1.0.0"', mix % '"1.0." <> "1"', ["Elixir code in mix.lock"]),
             ("mix.lock", "a git dependency on GitHub", mix % '"1.0.0"', mix_git, ["github.com"]),
@@ -1782,6 +1795,43 @@ class LockfileSources(Branch):
             ("package-lock.json", "a v1 alias", v1({"y": reg_v1}),
              v1({"y": reg_v1, "x": {"version": "npm:z@1.0.0", "resolved": "https://registry.npmjs.org/z/-/z-1.0.0.tgz"}}),
              []),
+            # Yarn and pnpm install any file on the registry an entry names, under the entry's name; a file
+            # there is a package anybody can publish.
+            ("yarn.lock", "another package's tarball in Yarn 1", yarn_x,
+             yarn % "https://registry.yarnpkg.com/evil/-/evil-1.0.0.tgz", [not_named("x@^1.0.0")]),
+            ("yarn.lock", "a path Yarn 1 joins to the registry's address", yarn_x, yarn % "evil/-/evil-1.0.0.tgz#abc",
+             [not_named("x@^1.0.0")]),
+            ("yarn.lock", "a Yarn 1 alias names the package it installs", yarn_x,
+             '"x@npm:y@^1.0.0":\n  version "1.0.0"\n  resolved "https://registry.yarnpkg.com/y/-/y-1.0.0.tgz#abc"\n', []),
+            ("yarn.lock", "another package as a Yarn 2 resolution", berry("1.0.0"), berry_res("evil@npm:1.0.0"),
+             [not_named("x@npm:^1.0.0")]),
+            ("yarn.lock", "another package's archive in a Yarn 2 resolution", berry("1.0.0"),
+             berry_res("x@npm:1.0.0::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fevil%2F-%2Fevil-1.0.0.tgz"),
+             [not_named("x@npm:^1.0.0")]),
+            ("yarn.lock", "another package in a file moved right", berry("1.0.0"), shift(berry_res("evil@npm:1.0.0")),
+             [not_named("x@npm:^1.0.0")]),
+            ("yarn.lock", "an entry the branch leaves alone is not read again", yarn_x + odd_y,
+             (yarn % "https://registry.yarnpkg.com/x/-/x-1.0.1.tgz").replace('"1.0.0"', '"1.0.1"') + odd_y, []),
+            ("pnpm-lock.yaml", "another package's tarball", pnpm_x,
+             pnpm % "{integrity: sha512-AAAA, tarball: https://registry.npmjs.org/evil/-/evil-1.0.0.tgz}",
+             [not_named("x@1.0.0", "pnpm-lock.yaml")]),
+            ("pnpm-lock.yaml", "its own tarball", pnpm_x,
+             pnpm % "{integrity: sha512-AAAA, tarball: https://registry.npmjs.org/x/-/x-1.0.0.tgz}", []),
+            ("pnpm-lock.yaml", "a path pnpm joins to the registry's address, in a file moved right", pnpm_x,
+             shift(pnpm_block), [not_named("x@1.0.0", "pnpm-lock.yaml")]),
+            # pnpm 10 and 11 install the package a project's version names, checking only that the specifier
+            # matches package.json.
+            ("pnpm-lock.yaml", "a dependency locked to another package", pnpm_dep("^1.0.0", "1.0.0"),
+             pnpm_dep("^1.0.0", "evil@1.0.0"), [alias]),
+            ("pnpm-lock.yaml", "another package in a file moved right", pnpm_dep("^1.0.0", "1.0.0"),
+             shift(pnpm_dep("^1.0.0", "evil@1.0.0(react@18.0.0)")), [alias]),
+            ("pnpm-lock.yaml", "an alias its specifier names", pnpm_dep("^1.0.0", "1.0.0"), pnpm_dep("npm:y@^1.0.0", "y@1.0.0"), []),
+            ("pnpm-lock.yaml", "an alias a catalog names", pnpm_dep("^1.0.0", "1.0.0"),
+             pnpm_dep("'catalog:'", "y@1.0.0", catalog), []),
+            ("pnpm-lock.yaml", "a JSR package, which pnpm installs under an npm name", pnpm_dep("^1.0.0", "1.0.0"),
+             pnpm_dep("jsr:@std/assert@^1.0.0", "'@jsr/std__assert@1.0.19'"), []),
+            ("pnpm-lock.yaml", "another package for a JSR one", pnpm_dep("^1.0.0", "1.0.0"),
+             pnpm_dep("jsr:@std/assert@^1.0.0", "'@jsr/std__evil@1.0.19'"), [alias]),
         ]
         for name, why, before, after, want in rows:
             with self.subTest(name=name, why=why):

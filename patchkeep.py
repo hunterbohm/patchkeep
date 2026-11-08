@@ -1331,13 +1331,18 @@ def read_sources(repo_dir, base, path, name, section):
     """The foreign sources in what the tools read from one changed lockfile, against its text in the base:
     for JSON and TOML, strings that are new as decoded; for a requirements file, the lines pip joins, each
     new one also having to name only a package on the index (an option such as `-r other.txt` pulls in a
-    file this check never reads)."""
-    if name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt", "bun.lock"}:
+    file this check never reads); for yarn.lock and pnpm-lock.yaml, entries that install a registry file
+    under another package's name (yarn_swaps, pnpm_swaps), which no host in the text gives away."""
+    if name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt", "bun.lock", "yarn.lock", "pnpm-lock.yaml"}:
         return set()
     new = blob(repo_dir, "HEAD", path)
     if new is None:
         return set() if "\ndeleted file mode" in section else {"a %s that is not UTF-8 text" % name}
     old = blob(repo_dir, "origin/" + base, path)
+    if name == "yarn.lock":
+        return yarn_swaps(old, new)
+    if name == "pnpm-lock.yaml":
+        return pnpm_swaps(old, new)
     hosts = LOCK_HOSTS.get(name)
     found = set()
     if name == "requirements.txt":
@@ -2301,8 +2306,358 @@ def npm_release(key, entry, resolved=True):
         return False
     if not resolved and "resolved" not in entry:
         return True
+    return entry.get("resolved") in registry_tarballs(name, version)
+
+
+# Yarn and js-yaml (which pnpm reads its lockfile with) break lines at \r\n, \r and \n only. str.splitlines
+# also breaks at \x85,   and more, which they read as text.
+LINE_BREAK = re.compile(r"\r\n|\r|\n")
+BLOCK_SCALAR = re.compile(r"[|>][-+]?\d?[-+]?")
+# `name@range`, the name maybe scoped: `@babel/core@^7.0.0`, `ms@npm:left-pad@1.3.0`.
+NPM_SPEC = re.compile(r"((?:@[^/@\s]+/)?[^@\s]+)@(.*)", re.S)
+
+
+def outline(text, split, flow=False):
+    """(parents, key, value) for each line of an indented key-value file, yarn.lock or pnpm-lock.yaml:
+    `parents` the keys of the less indented lines above it, read by indentation alone, so a file moved right
+    as a whole, or fields indented more than Yarn writes them, read the same. `split` turns a line into
+    (key, value), value None for a key with lines under it, or None for a line it does not read (the line
+    checks report those). Blank lines, comments and a block scalar's text are skipped, `---` starts a new
+    document, and YAML's merge key `<<` is left out of the parents. With `flow`, a flow mapping value
+    (`{integrity: x, tarball: y}`) also gives a line for each of its pairs."""
+    out, stack, scalar = [], [], None
+    for line in LINE_BREAK.split(text.lstrip("﻿")):
+        body = line.lstrip(" ").rstrip(" \t")
+        indent = len(line) - len(line.lstrip(" "))
+        if scalar is not None and (not body or indent > scalar):
+            continue
+        scalar = None
+        if not body or body.startswith("#"):
+            continue
+        if body == "---":
+            stack = []
+            continue
+        pair = split(body)
+        if pair is None:
+            continue
+        key, value = pair
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parents = tuple(k for _, k in stack if k != "<<")
+        if key != "<<":
+            out.append((parents, key, value))
+        if value is None:
+            stack.append((indent, key))
+        elif body.endswith(("'", '"')):
+            continue
+        elif BLOCK_SCALAR.fullmatch(value):
+            scalar = indent
+        elif flow and value.startswith("{") and value.endswith("}"):
+            inner = parents + ((key,) if key != "<<" else ())
+            out.extend((inner, k, v) for k, v in filter(None, map(_yaml_pair, _flow_items(value[1:-1]))))
+    return out
+
+
+def _unquote(text):
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return text[1:-1]
+    if len(text) >= 2 and text[0] == text[-1] == "'":
+        return text[1:-1].replace("''", "'")
+    return text
+
+
+def _quoted_end(text):
+    """The index just past the quoted string `text` starts with, or -1."""
+    q, i = text[0], 1
+    while i < len(text):
+        if text[i] == q:
+            if q == "'" and text[i + 1:i + 2] == "'":
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return -1
+
+
+def _flow_items(text):
+    """The items of a flow collection's inside, split at commas outside quotes."""
+    items, i, start = [], 0, 0
+    while i < len(text):
+        if text[i] in "\"'":
+            end = _quoted_end(text[i:])
+            i = len(text) if end < 0 else i + end
+            continue
+        if text[i] == ",":
+            items.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    items.append(text[start:].strip())
+    return [t for t in items if t]
+
+
+def _yaml_pair(body):
+    """(key, value) of a YAML mapping line or flow pair, value None when nothing follows the colon."""
+    if body.startswith(("'", '"')):
+        end = _quoted_end(body)
+        if end < 0 or not body[end:].startswith(":"):
+            return None
+        key, rest = _unquote(body[:end]), body[end + 1:]
+    else:
+        m = re.match(r"(.*?):(?: (.*)|$)", body)
+        if not m:
+            return None
+        key, rest = m.group(1).strip(), m.group(2) or ""
+    rest = rest.strip()
+    return key, (_unquote(rest) if rest else None)
+
+
+def _yarn_split(body):
+    """(key, value) of a yarn.lock line: Yarn 1's `key value` or the YAML `key: value` of Yarn 2 and later,
+    keys and values quoted or not. A key line (`"a@^1", "a@^2":`) keeps its descriptors, quotes taken off."""
+    if body.endswith(":"):
+        return body[:-1].replace('"', ""), None
+    if body.startswith('"'):
+        end = body.find('"', 1)
+        if end < 0:
+            return None
+        key, rest = body[1:end], body[end + 1:]
+        rest = rest[1:] if rest.startswith(":") else rest
+        if not rest.startswith(" "):
+            return None
+    else:
+        m = re.match(r'([^\s:"]+):? (.*)', body)
+        if not m:
+            return None
+        key, rest = m.groups()
+    return key, _unquote(rest.strip())
+
+
+def _pnpm_split(body):
+    return None if body.startswith("- ") else _yaml_pair(body)
+
+
+def yarn_entries(text):
+    """[(descriptors, fields)] for each entry of a yarn.lock, in Yarn 1's format or the YAML of Yarn 2 and
+    later: the descriptors its key lists (`name@range`, several sharing one entry) and {field: [value]} for
+    the fields directly under it, every value of a field given twice."""
+    entries = []
+    for parents, key, value in outline(text, _yarn_split):
+        if not parents:
+            entries.append(([d for d in re.split(r"\s*,\s*", key) if d] if value is None else [], {}))
+        elif len(parents) == 1 and value is not None and entries:
+            entries[-1][1].setdefault(key, []).append(value)
+    return entries
+
+
+def yarn_package(descriptor):
+    """The registry package a yarn.lock descriptor (`name@range`) asks for: its name, but an alias's target
+    (`ms@npm:left-pad@1.3.0` asks for left-pad), and for a patch, the package the patch is for
+    (`resolve@patch:resolve@npm%3A^1.22.8#optional!builtin<compat/resolve>` asks for resolve)."""
+    m = NPM_SPEC.fullmatch(descriptor)
+    if not m:
+        return descriptor
+    name, rng = m.groups()
+    if rng.startswith("patch:"):
+        return yarn_package(urllib.parse.unquote(rng[6:].split("#", 1)[0]))
+    if rng.startswith("npm:"):
+        target = NPM_SPEC.fullmatch(rng[4:])
+        if target:
+            return target.group(1)
+    return name
+
+
+def pnpm_rows(text):
+    return outline(text, _pnpm_split, flow=True)
+
+
+def pnpm_entries(rows, section="packages"):
+    """[(key, [(path, field, value)])] for each entry of a top-level section of pnpm-lock.yaml, the path
+    being the keys between the entry and the field."""
+    entries = []
+    for parents, key, value in rows:
+        if parents == (section,):
+            entries.append((key, []))
+        elif parents[:1] == (section,) and entries:
+            entries[-1][1].append((parents[2:], key, value))
+    return entries
+
+
+PNPM_V5_KEY = re.compile(r"((?:@[^/@]+/)?[^/@]+)/(\d[^/_]*)(?:_.*)?")
+
+
+def pnpm_key(key):
+    """(name, version) a pnpm-lock.yaml package key names: `name@version`, with a peer suffix in parentheses
+    (lockfile v6 on; v6 starts it with `/`), or v5's `/name/version`, with one after `_`."""
+    key = key.split("(", 1)[0]
+    v5 = PNPM_V5_KEY.fullmatch(key[1:]) if key.startswith("/") else None
+    if v5:
+        return v5.group(1), v5.group(2)
+    m = NPM_SPEC.fullmatch(key.lstrip("/"))
+    return (m.group(1), m.group(2)) if m else (key.lstrip("/"), "")
+
+
+def registry_tarballs(name, version):
+    """The npm registry's own addresses for the tarball of `name` at `version`."""
     tail = "/%s/-/%s-%s.tgz" % (name, name.rsplit("/", 1)[-1], version)
-    return entry.get("resolved") in {"https://" + h + tail for h in NPM_HOSTS}
+    return {"https://" + h + tail for h in NPM_HOSTS}
+
+
+URL_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*):")
+
+
+def registry_fetch(url):
+    """True when Yarn 1 or pnpm would download `url` from the npm registry, as far as the line checks leave
+    it to this one: an address without a scheme, which they join to the registry's
+    (`left-pad/-/left-pad-1.3.0.tgz`), or an http or https one on a registry host. A URL on another host, a
+    GitHub shorthand and an escape are reported by the line checks."""
+    if "\\" in url or BARE_GITHUB.fullmatch(url) or named_sources(url, NPM_HOSTS):
+        return False
+    scheme = URL_SCHEME.match(url)
+    return not scheme or scheme.group(1).lower() in ("http", "https")
+
+
+def registry_release(name, version, url):
+    """True when `url` is the registry's own tarball of `name` at `version` (Yarn 1's hash fragment aside).
+    A version or name that is not one would make a path to another package's file."""
+    return bool(name and version and NPM_NAME.fullmatch(name) and SEMVER.fullmatch(version)
+                and url.split("#", 1)[0] in registry_tarballs(name, version))
+
+
+def yarn_resolution_ok(resolution, package, version):
+    """False when a Yarn 2 or later `resolution` takes from the npm registry anything but `package` at
+    `version`: every layer a patch wraps (`x@patch:x@npm%3A1.0.0#./p.patch`, decoded once a layer, as Yarn
+    decodes it) is for `package`, and the one inside is `package@npm:version` exactly, without an
+    `::__archiveUrl=` naming another file. A URL on a registry host is a file there too; any other source is
+    the line checks' to report."""
+    while True:
+        m = NPM_SPEC.fullmatch(resolution)
+        if not m:
+            return True
+        ident, ref = m.groups()
+        if not ref.startswith("patch:"):
+            break
+        if ident != package:
+            return False
+        resolution = urllib.parse.unquote(ref[6:].split("#", 1)[0])
+    if ref.startswith("npm:"):
+        return bool(package and version and ident == package and ref[4:] == version
+                    and NPM_NAME.fullmatch(package) and SEMVER.fullmatch(version))
+    scheme = URL_SCHEME.match(ref)
+    return not (scheme and scheme.group(1).lower() in ("http", "https") and not named_sources(ref, NPM_HOSTS))
+
+
+def yarn_swaps(old, new):
+    """The entries a yarn.lock adds or changes that install from the npm registry something other than the
+    release their descriptors name (yarn_package) at their version. Yarn 1 downloads an entry's
+    `resolved`, Yarn 2 and later its `resolution`, and neither checks it against the name: any file on the
+    registry is a package anybody can publish, installed under the name that was checked."""
+    def key(entry):
+        return tuple(entry[0]), tuple(sorted((k, tuple(v)) for k, v in entry[1].items()))
+    before = {key(e) for e in yarn_entries(old)} if old is not None else set()
+    found = set()
+    for descriptors, fields in yarn_entries(new):
+        if not descriptors or descriptors == ["__metadata"] or key((descriptors, fields)) in before:
+            continue
+        packages = {yarn_package(d) for d in descriptors}
+        package = packages.pop() if len(packages) == 1 else None
+        version = fields["version"][0] if len(fields.get("version", [])) == 1 else None
+        if (any(registry_fetch(url) and not registry_release(package, version, url) for url in fields.get("resolved", []))
+                or not all(yarn_resolution_ok(r, package, version) for r in fields.get("resolution", []))):
+            found.add("%s in yarn.lock (not the registry release it names)" % descriptors[0])
+    return found
+
+
+PNPM_DEP_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
+
+
+def pnpm_dependencies(rows):
+    """({(importer, section, name): [version]}, {(importer, section, name): [specifier]}) for the
+    dependencies the projects of a pnpm-lock.yaml list: under `importers`, or for a single project in the
+    top-level sections of lockfile v5 and v6. In v5 a version is a string and the specifiers are a map of
+    their own (section None)."""
+    versions, specs = {}, {}
+    for parents, key, value in rows:
+        path, project = parents + (key,), "."
+        if value is None:
+            continue
+        if path[0] == "importers":
+            if len(path) < 3:
+                continue
+            project, path = path[1], path[2:]
+        if len(path) == 2 and path[0] == "specifiers":
+            specs.setdefault((project, None, path[1]), []).append(value)
+        elif len(path) == 2 and path[0] in PNPM_DEP_SECTIONS and not value.startswith("{"):
+            versions.setdefault((project, path[0], path[1]), []).append(value)
+        elif len(path) == 3 and path[0] in PNPM_DEP_SECTIONS and path[2] in ("specifier", "version"):
+            (specs if path[2] == "specifier" else versions).setdefault((project, path[0], path[1]), []).append(value)
+    return versions, specs
+
+
+def pnpm_alias(version):
+    """The package a pnpm-lock.yaml dependency's version installs under the dependency's name, or None for
+    a plain version: v6 and later write an alias as `name@version` (v6 with a leading `/`), v5 as
+    `/name/version`, and a peer suffix follows in parentheses (v5: after `_`)."""
+    v = version.split("(", 1)[0]
+    plain = SEMVER.match(v)
+    if (plain and v[plain.end():][:1] in ("", "_")) or v.startswith(("link:", "file:")) or "://" in v:
+        return None
+    v5 = PNPM_V5_KEY.fullmatch(v[1:]) if v.startswith("/") else None
+    if v5:
+        return v5.group(1)
+    m = NPM_SPEC.fullmatch(v.lstrip("/"))
+    return m.group(1) if m else None
+
+
+def alias_named(spec, target, dep):
+    """True when a pnpm specifier asks for `target` under the name `dep`: `npm:target@range` or `npm:target`,
+    or a JSR package, which pnpm installs as `@jsr/scope__name` (`jsr:^1.0.0` for the dependency's own
+    name, or `jsr:@scope/name@range`)."""
+    if spec == "npm:" + target or spec.startswith("npm:%s@" % target):
+        return True
+    if not spec.startswith("jsr:"):
+        return False
+    rest = spec[4:]
+    m = NPM_SPEC.fullmatch(rest) if rest.startswith("@") else None
+    name = (m.group(1) if m else rest) if rest.startswith("@") else dep
+    return bool(re.fullmatch(r"@[^/@]+/[^/@]+", name)) and target == "@jsr/" + name[1:].replace("/", "__", 1)
+
+
+def pnpm_swaps(old, new):
+    """The entries a pnpm-lock.yaml adds or changes that install a package other than the one asked for:
+    a package whose tarball is a registry file other than its own (pnpm 10 downloads it, joining an address
+    without a scheme to the registry's), and a project's dependency locked to another package
+    (`version: left-pad@1.3.0`) though its specifier, which must match package.json, does not ask for that
+    alias (alias_named, directly, through a catalog or through an override). pnpm 10 and 11 install
+    both."""
+    rows, before = pnpm_rows(new), pnpm_rows(old) if old is not None else []
+    seen = {(k, tuple(f)) for k, f in pnpm_entries(before)}
+    found = set()
+    for key, fields in pnpm_entries(rows):
+        if (key, tuple(fields)) in seen:
+            continue
+        name, version = pnpm_key(key)
+        if any(path == ("resolution",) and field == "tarball" and value and registry_fetch(value)
+               and not registry_release(name, version, value) for path, field, value in fields):
+            found.add("%s in pnpm-lock.yaml (not the registry release it names)" % key)
+    versions, specs = pnpm_dependencies(rows)
+    old_versions, old_specs = pnpm_dependencies(before)
+    catalogs = {(p[1], p[2]): v for p, k, v in rows if p[:1] == ("catalogs",) and len(p) == 3 and k == "specifier"}
+    overrides = {k: v for p, k, v in rows if p == ("overrides",) and v}
+    for (project, section, dep), locked in versions.items():
+        asked = specs.get((project, section, dep), []) + specs.get((project, None, dep), [])
+        if (locked, asked) == (old_versions.get((project, section, dep)),
+                               old_specs.get((project, section, dep), []) + old_specs.get((project, None, dep), [])):
+            continue
+        for v in locked:
+            target = pnpm_alias(v)
+            if target is None or target == dep:
+                continue
+            if not asked or not all(alias_named(s, target, dep) or alias_named(overrides.get(dep, ""), target, dep)
+                                    or (s.startswith("catalog:")
+                                        and alias_named(catalogs.get((s[8:] or "default", dep), ""), target, dep))
+                                    for s in asked):
+                found.add("%s in pnpm-lock.yaml (an alias its specifier does not name)" % dep)
+    return found
 
 
 def npm_registry(key, entry):
