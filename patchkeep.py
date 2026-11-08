@@ -2323,8 +2323,9 @@ def outline(text, split, flow=False):
     as a whole, or fields indented more than Yarn writes them, read the same. `split` turns a line into
     (key, value), value None for a key with lines under it, or None for a line it does not read (the line
     checks report those). Blank lines, comments and a block scalar's text are skipped, `---` starts a new
-    document, and YAML's merge key `<<` is left out of the parents. With `flow`, a flow mapping value
-    (`{integrity: x, tarball: y}`) also gives a line for each of its pairs."""
+    document, and YAML's merge key `<<` is left out of the parents. A list item is a parent `-` of its own,
+    its content two columns in. With `flow`, a flow mapping value (`{integrity: x, tarball: y}`) also gives
+    a line for each of its pairs."""
     out, stack, scalar = [], [], None
     for line in LINE_BREAK.split(text.lstrip("﻿")):
         body = line.lstrip(" ").rstrip(" \t")
@@ -2337,6 +2338,13 @@ def outline(text, split, flow=False):
         if body == "---":
             stack = []
             continue
+        while body.startswith("- "):
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            stack.append((indent, "-"))
+            rest = body[2:]
+            indent += 2 + len(rest) - len(rest.lstrip(" "))
+            body = rest.lstrip(" ")
         pair = split(body)
         if pair is None:
             continue
@@ -2432,10 +2440,6 @@ def _yarn_split(body):
     return key, _unquote(rest.strip())
 
 
-def _pnpm_split(body):
-    return None if body.startswith("- ") else _yaml_pair(body)
-
-
 def yarn_entries(text):
     """[(descriptors, fields)] for each entry of a yarn.lock, in Yarn 1's format or the YAML of Yarn 2 and
     later: the descriptors its key lists (`name@range`, several sharing one entry) and {field: [value]} for
@@ -2467,7 +2471,17 @@ def yarn_package(descriptor):
 
 
 def pnpm_rows(text):
-    return outline(text, _pnpm_split, flow=True)
+    return outline(text, _yaml_pair, flow=True)
+
+
+def pnpm_v5(rows):
+    """True for a pnpm-lock.yaml in the format of lockfile v5 and before, where a peer suffix follows `_`
+    and an alias is `/name/version`. From v6 on, `_` can only be part of a package name."""
+    for parents, key, value in rows:
+        if not parents and key == "lockfileVersion":
+            m = re.match(r"(\d+)", value or "")
+            return bool(m) and int(m.group(1)) < 6
+    return False
 
 
 def pnpm_entries(rows, section="packages"):
@@ -2485,11 +2499,11 @@ def pnpm_entries(rows, section="packages"):
 PNPM_V5_KEY = re.compile(r"((?:@[^/@]+/)?[^/@]+)/(\d[^/_]*)(?:_.*)?")
 
 
-def pnpm_key(key):
+def pnpm_key(key, v5=False):
     """(name, version) a pnpm-lock.yaml package key names: `name@version`, with a peer suffix in parentheses
-    (lockfile v6 on; v6 starts it with `/`), or v5's `/name/version`, with one after `_`."""
+    (lockfile v6 on; v6 starts it with `/`), or with `v5`, `/name/version`, with one after `_`."""
     key = key.split("(", 1)[0]
-    v5 = PNPM_V5_KEY.fullmatch(key[1:]) if key.startswith("/") else None
+    v5 = PNPM_V5_KEY.fullmatch(key[1:]) if v5 and key.startswith("/") else None
     if v5:
         return v5.group(1), v5.group(2)
     m = NPM_SPEC.fullmatch(key.lstrip("/"))
@@ -2593,17 +2607,18 @@ def pnpm_dependencies(rows):
     return versions, specs
 
 
-def pnpm_alias(version):
+def pnpm_alias(version, v5=False):
     """The package a pnpm-lock.yaml dependency's version installs under the dependency's name, or None for
-    a plain version: v6 and later write an alias as `name@version` (v6 with a leading `/`), v5 as
-    `/name/version`, and a peer suffix follows in parentheses (v5: after `_`)."""
+    a plain version: v6 and later write an alias as `name@version` (v6 with a leading `/`) and a peer
+    suffix in parentheses. With `v5` (pnpm_v5) an alias is `/name/version` and a peer suffix
+    follows `_`; later, `1.0.0_evil@1.0.0` is the package `1.0.0_evil`."""
     v = version.split("(", 1)[0]
     plain = SEMVER.match(v)
-    if (plain and v[plain.end():][:1] in ("", "_")) or v.startswith(("link:", "file:")) or "://" in v:
+    if (plain and v[plain.end():][:1] in (("", "_") if v5 else ("",))) or v.startswith(("link:", "file:")) or "://" in v:
         return None
-    v5 = PNPM_V5_KEY.fullmatch(v[1:]) if v.startswith("/") else None
-    if v5:
-        return v5.group(1)
+    m = PNPM_V5_KEY.fullmatch(v[1:]) if v5 and v.startswith("/") else None
+    if m:
+        return m.group(1)
     m = NPM_SPEC.fullmatch(v.lstrip("/"))
     return m.group(1) if m else None
 
@@ -2624,21 +2639,25 @@ def alias_named(spec, target, dep):
 
 def pnpm_swaps(old, new):
     """The entries a pnpm-lock.yaml adds or changes that install a package other than the one asked for:
-    a package whose tarball is a registry file other than its own (pnpm 10 downloads it, joining an address
-    without a scheme to the registry's), and a project's dependency locked to another package
+    a package whose download (`tarball`, or a binary's `url`, anywhere in its resolution, its variants'
+    included) is a registry file other than its own (pnpm 10 downloads it, joining an address without a
+    scheme to the registry's), in `packages` or in `snapshots`, whose fields pnpm takes for an entry that
+    `packages` leaves without them; and a project's dependency locked to another package
     (`version: left-pad@1.3.0`) though its specifier, which must match package.json, does not ask for that
     alias (alias_named, directly, through a catalog or through an override). pnpm 10 and 11 install
     both."""
     rows, before = pnpm_rows(new), pnpm_rows(old) if old is not None else []
-    seen = {(k, tuple(f)) for k, f in pnpm_entries(before)}
+    v5 = pnpm_v5(rows)
     found = set()
-    for key, fields in pnpm_entries(rows):
-        if (key, tuple(fields)) in seen:
-            continue
-        name, version = pnpm_key(key)
-        if any(path == ("resolution",) and field == "tarball" and value and registry_fetch(value)
-               and not registry_release(name, version, value) for path, field, value in fields):
-            found.add("%s in pnpm-lock.yaml (not the registry release it names)" % key)
+    for section in ("packages", "snapshots"):
+        seen = {(k, tuple(f)) for k, f in pnpm_entries(before, section)}
+        for key, fields in pnpm_entries(rows, section):
+            if (key, tuple(fields)) in seen:
+                continue
+            name, version = pnpm_key(key, v5)
+            if any(path[:1] == ("resolution",) and field in ("tarball", "url") and value and registry_fetch(value)
+                   and not registry_release(name, version, value) for path, field, value in fields):
+                found.add("%s in pnpm-lock.yaml (not the registry release it names)" % key)
     versions, specs = pnpm_dependencies(rows)
     old_versions, old_specs = pnpm_dependencies(before)
     catalogs = {(p[1], p[2]): v for p, k, v in rows if p[:1] == ("catalogs",) and len(p) == 3 and k == "specifier"}
@@ -2649,7 +2668,7 @@ def pnpm_swaps(old, new):
                                old_specs.get((project, section, dep), []) + old_specs.get((project, None, dep), [])):
             continue
         for v in locked:
-            target = pnpm_alias(v)
+            target = pnpm_alias(v, v5)
             if target is None or target == dep:
                 continue
             if not asked or not all(alias_named(s, target, dep) or alias_named(overrides.get(dep, ""), target, dep)

@@ -1668,6 +1668,7 @@ class LockfileSources(Branch):
                                                     "      x:\n        specifier: %s\n        version: %s\n" % (extra, spec, version))
         catalog = "catalogs:\n  default:\n    x:\n      specifier: npm:y@^1.0.0\n      version: 1.0.0\n\n"
         alias = "x in pnpm-lock.yaml (an alias its specifier does not name)"
+        v5_dep = lambda version: "lockfileVersion: 5.4\n\nspecifiers:\n  x: ^1.0.0\n\ndependencies:\n  x: %s\n" % version
         rows = [
             ("package-lock.json", "a registry bump", npm(), bump, []),
             ("package-lock.json", "a URL behind JSON escapes", npm(), npm("https://evil.example/x.tgz").replace(
@@ -1828,6 +1829,22 @@ class LockfileSources(Branch):
             ("pnpm-lock.yaml", "an alias its specifier names", pnpm_dep("^1.0.0", "1.0.0"), pnpm_dep("npm:y@^1.0.0", "y@1.0.0"), []),
             ("pnpm-lock.yaml", "an alias a catalog names", pnpm_dep("^1.0.0", "1.0.0"),
              pnpm_dep("'catalog:'", "y@1.0.0", catalog), []),
+            # From lockfile v6 on, `_` is part of a name; v5 wrote a peer suffix after it.
+            ("pnpm-lock.yaml", "a package whose name starts like a version", pnpm_dep("^1.0.0", "1.0.0"),
+             pnpm_dep("^1.0.0", "1.0.0_evil@1.0.0"), [alias]),
+            ("pnpm-lock.yaml", "a peer suffix in lockfile v5", v5_dep("1.0.0"), v5_dep("1.0.0_react@18.0.0"), []),
+            ("pnpm-lock.yaml", "another package in lockfile v5", v5_dep("1.0.0"), v5_dep("/evil/1.0.0"), [alias]),
+            # pnpm takes an entry's fields from `snapshots` when `packages` leaves them out, and downloads the
+            # variant of a resolution that matches the platform.
+            ("pnpm-lock.yaml", "another package's tarball in snapshots", pnpm_x,
+             "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0: {}\n\nsnapshots:\n\n  x@1.0.0:\n"
+             "    resolution: {integrity: sha512-AAAA, tarball: https://registry.npmjs.org/evil/-/evil-1.0.0.tgz}\n",
+             [not_named("x@1.0.0", "pnpm-lock.yaml")]),
+            ("pnpm-lock.yaml", "another package's tarball in a variant", pnpm_x,
+             "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      type: variations\n"
+             "      variants:\n        - resolution:\n            integrity: sha512-AAAA\n"
+             "            tarball: https://registry.npmjs.org/evil/-/evil-1.0.0.tgz\n          targets:\n"
+             "            - os: darwin\n", [not_named("x@1.0.0", "pnpm-lock.yaml")]),
             ("pnpm-lock.yaml", "a JSR package, which pnpm installs under an npm name", pnpm_dep("^1.0.0", "1.0.0"),
              pnpm_dep("jsr:@std/assert@^1.0.0", "'@jsr/std__assert@1.0.19'"), []),
             ("pnpm-lock.yaml", "another package for a JSR one", pnpm_dep("^1.0.0", "1.0.0"),
