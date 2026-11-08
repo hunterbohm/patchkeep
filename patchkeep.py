@@ -1038,15 +1038,44 @@ GIT_SHORTHAND = re.compile(r"(?<![\w/.-])(?:github|gitlab|bitbucket|gist):[\w.-]
 # `git@host:path`. Yarn writes its own protocols the same way (`x@npm:1.0.0`), and those are not hosts.
 SCP_URL = re.compile(r"(?<![\w/.:-])[\w.-]+@(?!(?:npm|patch|workspace|file|portal|link|exec|virtual):)([\w.-]+):[\w./~-]")
 URL_HOST = re.compile(r"([a-z][a-z0-9+.-]*)://([^/\s\"']+)", re.I)
+# The WHATWG URL rules npm, pnpm, Yarn, uv and Cargo read URLs by take `https:host/x`, `https:/host/x` and
+# `https:\\host\x` for https://host/x in the special schemes, behind a `git+` or other prefix too.
+SPECIAL_URL = re.compile(r"(?<![a-z0-9+.-])((?:[a-z][a-z0-9.-]*\+)?(?:https?|wss?|ftp)):[/\\]*([^/\\\s\"'?#]+)", re.I)
+# A WHATWG parser drops every tab and line break in a URL, so `https:<tab>//host` is https://host.
+URL_DROPPED = re.compile(r"[\t\n\r]")
+# A git URL without `//` (`git:host/x`, `git+ssh:host/x`, `ssh:host/x`), which Yarn takes for a checkout.
+GIT_SCHEME = re.compile(r"(?<![\w+./-])(git(?:\+(?!(?:https?|wss?|ftp):)[a-z0-9.-]+)?|ssh):(?!//)", re.I)
+# Each lockfile may name only its own ecosystem's registry. A Python sdist or a crate is a tarball too, and
+# npm would install one, with whatever install scripts it carries, as readily as its own.
+NPM_HOSTS = {"registry.npmjs.org", "registry.yarnpkg.com"}
+PYPI_HOSTS = {"pypi.org", "files.pythonhosted.org"}
+LOCK_HOSTS = dict.fromkeys(("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock"),
+                           NPM_HOSTS)
+LOCK_HOSTS.update(dict.fromkeys(("requirements.txt", "uv.lock", "poetry.lock", "Pipfile.lock"), PYPI_HOSTS))
+LOCK_HOSTS.update({"Cargo.lock": {"static.crates.io", "crates.io", "index.crates.io"},
+                   "go.sum": {"proxy.golang.org", "sum.golang.org"},
+                   "Gemfile.lock": {"rubygems.org", "index.rubygems.org"}, "mix.lock": {"repo.hex.pm"},
+                   "pom.xml": {"repo.maven.apache.org", "repo1.maven.org", "maven.apache.org", "www.w3.org"}})
+# Yarn 2 and later (isGitUrl in its git plugin) and Bun read a bare `owner/repo`, with an optional `.git`
+# and `#ref`, as a GitHub checkout. In their lockfiles one follows the `@` of `name@reference` or stands
+# alone as a dependency's range.
+BARE_GITHUB = re.compile(r"(?!\.{1,2}/)[A-Za-z0-9._-]+/(?!\.{1,2}(?:#|$))[A-Za-z0-9._-]+?(?:\.git)?(?:#.*)?")
+JS_WORD = re.compile(r"""[^\s"',\[\]{}()]+""")
+# yarn.lock lines whose values are hashes, not sources: a checksum (Yarn 2 writes `10c0/<hex>`) and an
+# integrity hash.
+YARN_HASH_LINE = re.compile(r"""^\s*"?(?:checksum|integrity)"?\s*:?\s""")
+# pnpm writes a git source as `resolution: {type: git, repo: ..., commit: ...}`, and git clones whatever
+# string `repo` holds.
+PNPM_GIT = re.compile(r"[{,]\s*['\"]?repo['\"]?\s*:|\btype['\"]?\s*:\s*['\"]?git\b")
 # Cargo names crates.io by its index on GitHub. Any other GitHub address in a lockfile is a checkout or a
 # source tarball, which runs that code's build and install scripts like any other foreign source.
 CRATES_INDEX = re.compile(r"registry\+https://github\.com/rust-lang/crates\.io-index(?=[\"')\s]|\Z)")
 JSON_LOCKS = {"package-lock.json", "npm-shrinkwrap.json", "Pipfile.lock"}
 TOML_LOCKS = {"uv.lock", "poetry.lock", "Cargo.lock"}
 # What hides text from a scan of lines in the formats read line by line: an escape, in YAML also a tag
-# (`!!binary` turns base64 into the text) outside a comment line, and in a POM a character reference or
-# an entity.
-YAML_HIDDEN = re.compile(r"^(?!\s*#).*?(?:\\|!)")
+# (`!!binary` turns base64 into the text), an anchor or an alias (`*a` stands for text set elsewhere)
+# outside a comment line, and in a POM a character reference or an entity.
+YAML_HIDDEN = re.compile(r"^(?!\s*#).*?(?:\\|!|(?:^|[\s\[{,:-])[&*][^\s,\[\]{}]+)")
 HIDDEN_TEXT = {"pnpm-lock.yaml": YAML_HIDDEN, "yarn.lock": YAML_HIDDEN,
                "pom.xml": re.compile(r"&#|<!ENTITY", re.I)}
 BACKSLASH = re.compile(r"\\")
@@ -1057,19 +1086,63 @@ MIX_TOKEN = re.compile(r'\s+|"[^"\\#]*":?|:"[^"\\#]*"|:[A-Za-z_]\w*[?!]?|[A-Za-z
                        r'|-?\d+(?:\.\d+)?\b|%\{|[{}\[\],]|=>')
 
 
-def named_sources(text):
-    """The foreign sources a piece of lockfile text names: a URL whose host is not a release host, in any
-    scheme (git://, ssh:// and git+https:// pull code too), a git URL on any host, the shorthand
+def named_sources(text, hosts=None):
+    """The foreign sources a piece of lockfile text names: a URL whose host is not one of `hosts` (the
+    lockfile's own registry, see LOCK_HOSTS; any release host when None), in any scheme (git://, ssh://
+    and git+https:// pull code too) and with or without its `//`, a git URL on any host, the shorthand
     `github:user/repo`, and the scp form `git@host:path`. The host is the whole text up to the first
     slash, so `registry.npmjs.org@evil.example` or a port is not taken for an allowed host."""
-    text = CRATES_INDEX.sub("", text)
+    hosts = RELEASE_HOSTS if hosts is None else hosts
+    text = CRATES_INDEX.sub("", URL_DROPPED.sub("", text))
     found = set()
-    for scheme, host in URL_HOST.findall(text):
+    for scheme, host in URL_HOST.findall(text) + SPECIAL_URL.findall(text):
         scheme, host = scheme.lower(), host.lower()
-        if host not in RELEASE_HOSTS or scheme.startswith("git"):
+        if host not in hosts or scheme.startswith("git"):
             found.add(host if scheme in ("http", "https") else "%s://%s" % (scheme, host))
     found |= {m.group(0) for m in GIT_SHORTHAND.finditer(text)}
     found |= {h.lower() for h in SCP_URL.findall(text)}
+    found |= {"a %s URL" % scheme.lower() for scheme in GIT_SCHEME.findall(text)}
+    return found
+
+
+def bare_github(text, key=False):
+    """The bare GitHub shorthands (BARE_GITHUB) in one word of a Yarn or Bun lockfile: after an `@` that ends
+    a name (`name@owner/repo`; not a scope's, as in Bun's `parent/@scope/name`), and the whole word unless
+    it is a key."""
+    found = {text[i + 1:] for i in range(1, len(text)) if text[i] == "@" and text[i - 1] != "/"}
+    if not key:
+        found.add(text)
+    return {"a GitHub checkout: " + c for c in found if BARE_GITHUB.fullmatch(c)}
+
+
+def yarn_bare_sources(lines):
+    """The bare GitHub shorthands on the added lines of a yarn.lock diff, keys left out as whole words.
+    Checksums and integrity hashes are not read, nor the commands a package installs (`tsc: bin/tsc`),
+    which sit in a `bin:` block: Yarn reads the file by indentation, and the diff's context lines give the
+    less indented lines above an added one."""
+    found, parents, hunk = set(), [], False
+    for line in lines:
+        if line.startswith("@@"):
+            parents, hunk = [], True
+            continue
+        if not hunk or line[:1] not in "+ ":
+            continue
+        body = line[1:]
+        text = body.strip()
+        if not text or text.startswith("#"):
+            continue
+        indent = len(body) - len(body.lstrip())
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        in_bin = any(key == "bin" for _, key in parents)
+        if text.endswith(":"):
+            parents.append((indent, text.split()[0].strip("\"':")))
+        if line[0] != "+" or in_bin or YARN_HASH_LINE.match(body):
+            continue
+        for m in JS_WORD.finditer(body):
+            word = m.group(0)
+            key = word.endswith(":") or body[m.end():].lstrip("\"'").startswith(":")
+            found |= bare_github(word.rstrip(":"), key)
     return found
 
 
@@ -1083,27 +1156,97 @@ def mix_data(line):
     return True
 
 
+def unique_keys(pairs):
+    """A JSON object with each key once. Readers differ on which of two copies wins, so a file with both
+    does not count as read."""
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("a key given twice")
+    return dict(pairs)
+
+
+def outside_strings(text, step):
+    """`text` with `step(text, i)` applied at each position outside a JSON string; `step` returns the text
+    to keep and the next position, or None to keep the character."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == '"':
+            j = i + 1
+            while j < len(text) and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        kept = step(text, i)
+        if kept is None:
+            out.append(text[i])
+            i += 1
+        else:
+            out.append(kept[0])
+            i = kept[1]
+    return "".join(out)
+
+
+TRAILING_COMMA = re.compile(r",(?=\s*[}\]])")
+
+
+def jsonc(text):
+    """Bun's lockfile, JSON with comments and trailing commas, as Python data."""
+    def comment(t, i):
+        if t.startswith("//", i):
+            end = t.find("\n", i)
+            return "", len(t) if end < 0 else end
+        if t.startswith("/*", i):
+            end = t.find("*/", i + 2)
+            if end < 0:
+                raise ValueError("an open comment")
+            return " ", end + 2
+        return None
+
+    def trailing_comma(t, i):
+        return ("", i + 1) if TRAILING_COMMA.match(t, i) else None
+
+    return json.loads(outside_strings(outside_strings(text, comment), trailing_comma), object_pairs_hook=unique_keys)
+
+
 def lock_strings(name, text):
-    """(field, string) for every string in a lockfile Python reads, keys included and escapes decoded,
-    `field` being the key it sits under. The funding links, deprecation notes and license fields of npm's
-    package entries and poetry's package descriptions are not sources and are left out. Raises ValueError when the text
-    does not parse."""
-    doc = json.loads(text) if name in JSON_LOCKS else tomllib.loads(text)
+    """(place, string) for every string in a lockfile Python reads, keys included and escapes decoded.
+    `place` is the path of keys down to the string, a list item going by its `name` when it has one, and
+    a key ends its path with None, so a string is only ever matched with the same string at the same place
+    in the base. The funding links, deprecation notes and license fields of npm's package entries and
+    poetry's package descriptions are not sources and are left out. Raises ValueError when the text does
+    not parse, or has a key twice in one object."""
+    doc = (json.loads(text, object_pairs_hook=unique_keys) if name in JSON_LOCKS
+           else jsonc(text) if name == "bun.lock" else tomllib.loads(text))
     if name in NPM_LOCKFILES and isinstance(doc, dict) and isinstance(doc.get("packages"), dict):
         doc = dict(doc, packages={k: {f: x for f, x in v.items() if f not in ("funding", "deprecated", "license")}
                                   if isinstance(v, dict) else v for k, v in doc["packages"].items()})
-    out, stack = set(), [("", doc)]
+    out, stack = set(), [((), doc)]
     while stack:
-        field, value = stack.pop()
+        place, value = stack.pop()
         if isinstance(value, dict):
             for k, v in value.items():
-                out.add((field, k))
-                stack.append((k, v))
+                out.add((place + (None,), k))
+                stack.append((place + (k,), v))
         elif isinstance(value, list):
-            stack.extend((field, v) for v in value)
-        elif isinstance(value, str) and not (name == "poetry.lock" and field == "description"):
-            out.add((field, value))
+            stack.extend((place + (("item", v["name"] if isinstance(v, dict) and isinstance(v.get("name"), str)
+                                     else None),), v) for v in value)
+        elif isinstance(value, str) and not (name == "poetry.lock" and place[-1:] == ("description",)):
+            out.add((place, value))
     return out
+
+
+def bun_bare_sources(fresh):
+    """The bare GitHub shorthands among the new strings of a bun.lock (see bare_github), but for the
+    commands a package or workspace installs: its own `bin` field, a path or an object of them (not a
+    dependency or package named bin)."""
+    found = set()
+    for place, text in fresh:
+        if ((len(place) > 3 and place[0] == "packages" and isinstance(place[2], tuple) and place[3] == "bin")
+                or (len(place) > 2 and place[0] == "workspaces" and place[2] == "bin")):
+            continue
+        found |= bare_github(text, place[-1:] == (None,))
+    return found
 
 
 def read_sources(repo_dir, base, path, name, section):
@@ -1111,31 +1254,36 @@ def read_sources(repo_dir, base, path, name, section):
     for JSON and TOML, strings that are new as decoded; for a requirements file, the lines pip joins, each
     new one also having to name only a package on the index (an option such as `-r other.txt` pulls in a
     file this check never reads)."""
-    if name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt"}:
+    if name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt", "bun.lock"}:
         return set()
     new = blob(repo_dir, "HEAD", path)
     if new is None:
         return set() if "\ndeleted file mode" in section else {"a %s that is not UTF-8 text" % name}
     old = blob(repo_dir, "origin/" + base, path)
+    hosts = LOCK_HOSTS.get(name)
     found = set()
     if name == "requirements.txt":
         before = set(pip_logical_lines(old)) if old is not None else set()
         for line in pip_logical_lines(new):
             if line and line not in before:
-                found |= named_sources(line)
+                found |= named_sources(line, hosts)
                 if not plain_requirement(line):
                     found.add("a pip line that is not a package on the index: " + line[:80])
         return found
+    if name in NPM_LOCKFILES:
+        found |= npm_sources(name, old, new)
     try:
         fresh = lock_strings(name, new)
     except (ValueError, RecursionError):
-        return {"a %s that does not parse" % name}
+        return found | {"a %s that does not parse" % name}
     try:
         fresh -= lock_strings(name, old) if old is not None else set()
     except (ValueError, RecursionError):
         pass
     for _, text in fresh:
-        found |= named_sources(text)
+        found |= named_sources(text, hosts)
+    if name == "bun.lock":
+        found |= bun_bare_sources(fresh)
     return found
 
 
@@ -1159,12 +1307,16 @@ def foreign_sources(diff, repo_dir=None, base=None):
             if not line.startswith("+") or (not hunk and line.startswith("+++ ")):
                 continue
             if i not in skip and not (name in NPM_LOCKFILES and NPM_NOTE.match(line)):
-                found |= named_sources(line[1:])
+                found |= named_sources(line[1:], LOCK_HOSTS.get(name))
+            if name == "pnpm-lock.yaml" and PNPM_GIT.search(line):
+                found.add("a git checkout in pnpm-lock.yaml")
             if name == "mix.lock":
                 if not mix_data(line[1:]):
                     found.add("Elixir code in mix.lock")
             elif name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt"} and HIDDEN_TEXT.get(name, BACKSLASH).search(line[1:]):
                 found.add("an escape or a tag in " + name)
+        if name == "yarn.lock":
+            found |= yarn_bare_sources(lines)
         if repo_dir is not None:
             found |= read_sources(repo_dir, base, path, name, text)
     return sorted(found)
@@ -1993,11 +2145,12 @@ NPM_RANGE_KEYS = {"dependencies", "devDependencies", "optionalDependencies", "pe
 UV_FILE_KEYS = {"url", "hash", "size", "upload-time"}
 
 
-def release_url(url):
-    """An https URL on a package registry's own host, not a GitHub checkout or tarball. The host is
-    everything up to the first slash, so a user name or a port is never taken for an allowed host."""
+def release_url(url, hosts=None):
+    """An https URL on one of `hosts` (any package registry's own host when None), not a GitHub checkout
+    or tarball. The host is everything up to the first slash, so a user name or a port is never taken for
+    an allowed host."""
     m = re.fullmatch(r"https://([^/@:\s]+)/\S*", url) if isinstance(url, str) else None
-    return bool(m) and m.group(1).lower() in RELEASE_HOSTS
+    return bool(m) and m.group(1).lower() in (RELEASE_HOSTS if hosts is None else hosts)
 
 
 def npm_lock(text):
@@ -2036,9 +2189,84 @@ def npm_lock(text):
     return out
 
 
-def npm_registry(entry):
-    return (isinstance(entry, dict) and set(entry) <= NPM_REGISTRY_KEYS and release_url(entry.get("resolved"))
-            and isinstance(entry.get("version"), str) and bool(SEMVER.fullmatch(entry["version"])))
+NPM_NAME = re.compile(r"(?:@[a-z0-9~-][\w.~-]*/)?[a-z0-9~-][\w.~-]*", re.I)
+# A link entry: a folder npm links to from node_modules, which it reads from disk.
+NPM_LINK_KEYS = {"resolved", "link", "dev", "optional", "devOptional", "peer"}
+
+
+def npm_release(key, entry, resolved=True):
+    """True when the entry at `key` installs a registry release of the package it names (its `name`, for an
+    alias, else its folder's), which is what the release-age rule looks up: only the fields a release has,
+    a plain version, and as `resolved` the registry's own tarball of that package at that version. Any
+    other file on a registry host is another package, one anybody can publish, which npm would install
+    under the name the rule checked. With `resolved` False a bundled entry passes too (npm takes it from
+    its parent's tarball), and one without a `resolved` (npm fetches it from the registry by name and
+    version)."""
+    path = key[1]
+    keys = NPM_REGISTRY_KEYS if resolved else NPM_REGISTRY_KEYS | {"inBundle", "bundled"}
+    if not (isinstance(entry, dict) and set(entry) <= keys and "node_modules/" in path):
+        return False
+    name = entry.get("name") or path.rsplit("node_modules/", 1)[-1]
+    if not (isinstance(name, str) and NPM_NAME.fullmatch(name) and isinstance(entry.get("version"), str)
+            and SEMVER.fullmatch(entry["version"])):
+        return False
+    if not resolved and "resolved" not in entry:
+        return True
+    tail = "/%s/-/%s-%s.tgz" % (name, name.rsplit("/", 1)[-1], entry["version"])
+    return entry.get("resolved") in {"https://" + h + tail for h in NPM_HOSTS}
+
+
+def npm_registry(key, entry):
+    return npm_release(key, entry)
+
+
+def npm_local(key, entry):
+    """True when npm reads the entry at `key` from disk: the project itself or a folder of it (a workspace),
+    with no `resolved` and only the fields such an entry has (no `scripts`), or a link to a folder."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("link") is True:
+        target = entry.get("resolved")
+        return (set(entry) <= NPM_LINK_KEYS and isinstance(target, str) and bool(target)
+                and not re.search(r"[:\\]|^/", target))
+    return ("node_modules" not in key[1].split("/") and "resolved" not in entry
+            and set(entry) <= NPM_REGISTRY_KEYS | {"devDependencies"})
+
+
+def npm_sources(name, old_text, new_text):
+    """What a branch adds to an npm lockfile that npm would fetch from anywhere but the registry, read the
+    way npm reads the file: a new or changed entry that is not a registry release (npm_release), not read
+    from disk (npm_local) and not from the source it had in the base, and a changed dependency spec of an
+    entry under node_modules that is not a registry spec, since npm resolves afresh, from wherever the spec
+    names, a dependency its locked entry does not satisfy. The project's own specs come from its
+    package.json, which the review reads."""
+    try:
+        new = npm_lock(new_text)
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return {"a %s npm would read differently" % name}
+    try:
+        old = npm_lock(old_text) if old_text is not None else {}
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        old = {}
+    found = set()
+    for key, entries in new.items():
+        if key[0] == "shape":
+            continue
+        before = old.get(key, [])
+        prior = before[0] if len(before) == 1 and isinstance(before[0], dict) else {}
+        where = "%s in %s" % (key[1] or "the project", name)
+        for entry in entries:
+            if any(same(entry, b) for b in before):
+                continue
+            if not (npm_release(key, entry, resolved=False) or npm_local(key, entry)
+                    or any(same(npm_source(entry), npm_source(b)) for b in before)):
+                found.add(where + " (not a registry release)")
+            if not key[1] or not isinstance(entry, dict):
+                continue
+            for field in NPM_NEEDS.get(key[0], ()):
+                if field in entry and not registry_specs_only(prior.get(field), entry[field]):
+                    found.add(where + " (a dependency spec that is not a registry version)")
+    return found
 
 
 def npm_source(entry):
@@ -2183,13 +2411,31 @@ def toml_packages(text):
     return out
 
 
-def uv_registry(p):
+def pypi_file(name, version, url):
+    """True when `url` is a file on PyPI's file host whose name is of the package `name` at `version`. A
+    file of another package (one anybody can publish) would install that package under this name. The
+    file name is the last part of the path, so a query, a fragment or an encoded slash is refused."""
+    if not (isinstance(url, str) and isinstance(name, str) and release_url(url, {"files.pythonhosted.org"})
+            and not re.search(r"[?#%]", url)):
+        return False
+    file = url.rsplit("/", 1)[-1]
+    if file.endswith(".whl"):
+        parts = file[:-4].split("-")
+        dist, ver = (parts[0], parts[1]) if len(parts) in (5, 6) else (None, None)
+    else:
+        m = re.fullmatch(r"(.+)-([^-]+)\.(?:tar\.gz|zip|tar\.bz2)", file)
+        dist, ver = m.groups() if m else (None, None)
+    return dist is not None and canon(dist) == canon(name) and ver == version
+
+
+def uv_registry(key, p):
     source, files = p.get("source"), p.get("wheels", [])
     if not isinstance(files, list):
         return False
     files = files + ([p["sdist"]] if "sdist" in p else [])
-    return (isinstance(source, dict) and list(source) == ["registry"] and release_url(source["registry"])
-            and all(isinstance(f, dict) and set(f) <= UV_FILE_KEYS and release_url(f.get("url")) for f in files))
+    return (isinstance(source, dict) and list(source) == ["registry"] and release_url(source["registry"], PYPI_HOSTS)
+            and all(isinstance(f, dict) and set(f) <= UV_FILE_KEYS and pypi_file(p.get("name"), p.get("version"), f.get("url"))
+                    for f in files))
 
 
 LOCK_READERS = {
@@ -2199,9 +2445,9 @@ LOCK_READERS = {
                 toml_complete(uv_needs)),
     # poetry.lock names a dependency without its source, so a changed entry must be a plain version
     # requirement, not a path, URL or git table. Cargo tells `foo-bar` from `foo_bar`.
-    "poetry.lock": (toml_packages, lambda p: "source" not in p, lambda p: p.get("source"),
+    "poetry.lock": (toml_packages, lambda key, p: "source" not in p, lambda p: p.get("source"),
                     toml_complete(poetry_needs, specs=poetry_entries_ok)),
-    "Cargo.lock": (toml_packages, lambda p: p.get("source") in CRATES_IO, lambda p: p.get("source"),
+    "Cargo.lock": (toml_packages, lambda key, p: p.get("source") in CRATES_IO, lambda p: p.get("source"),
                    toml_complete(cargo_needs, key=lambda name: name)),
 }
 
@@ -2229,12 +2475,12 @@ def lock_ok(name, old_text, new_text):
         for key, packages in new.items():
             before = old.get(key, [])
             for p in packages:
-                if not registry(p) and not any(same(source(p), source(b)) for b in before):
+                if not registry(key, p) and not any(same(source(p), source(b)) for b in before):
                     return False
         for key, packages in old.items():
             after = new.get(key, [])
             for b in packages:
-                if not registry(b) and not any(same(source(p), source(b)) for p in after):
+                if not registry(key, b) and not any(same(source(p), source(b)) for p in after):
                     return False
     except (ValueError, TypeError, AttributeError, RecursionError):
         return False
@@ -2364,7 +2610,7 @@ def fix(repo, items_path):
                 refuse("it is too large to review in full")
                 return
             if foreign:
-                refuse("it pulls packages from unexpected hosts (%s)" % ", ".join(foreign[:3]))
+                refuse("it pulls packages from unexpected sources (%s)" % ", ".join(foreign[:3]))
                 return
             body = (res.get("pr_body") or "") + "\n\nAutomated by patchkeep."
             agree, verdict = sol_review(body, diff, history)

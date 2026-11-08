@@ -533,7 +533,8 @@ class GitAttributesFlow(Flow):
 
     def test_a_foreign_host_in_the_lockfile_is_still_caught(self):
         self.writers = [lambda c: bump(c, host="evil.example")]
-        self.assertNotPushed(self.fix(), "it pulls packages from unexpected hosts (evil.example)")
+        self.assertNotPushed(self.fix(), "it pulls packages from unexpected sources (evil.example, node_modules/x in package-lock.json "
+                              "(not a registry release))")
 
     def test_editing_gitattributes_is_refused(self):
         self.writers = [bump_then(lambda c: put(c.agent_dir, {".gitattributes": "* binary\n"}))]
@@ -1622,21 +1623,42 @@ class LockfileSources(Branch):
         mix_git = '%{\n  "x": {:git, "https://github.com/e/x.git", "abc", [branch: "main"]},\n}\n'
         pnpm_flow = ("lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0: {\n"
                      "    deprecated: 'x', resolution: {tarball: https://evil.example/x.tgz}}\n")
+        not_registry = lambda name: "node_modules/%s in package-lock.json (not a registry release)" % name
+        bump = npm("https://registry.npmjs.org/x/-/x-1.0.1.tgz").replace('"version": "1.0.0"', '"version": "1.0.1"')
+        meta = lambda text: text.replace('"lockfileVersion": 3,',
+                                         '"lockfileVersion": 3,\n  "x-meta": {"resolved": "https://evil.example/x.tgz"},')
+        hidden = meta(npm("ESCAPED")).replace("ESCAPED", "https:\\/\\/evil.example\\/x.tgz")
+        workspace = json.loads(npm())
+        workspace["packages"].update({"packages/a": {"name": "a", "version": "1.0.0", "dependencies": {"y": "^1"}},
+                                      "node_modules/a": {"resolved": "packages/a", "link": True},
+                                      "node_modules/x/node_modules/b": {"version": "1.0.0", "inBundle": True}})
+        workspace = json.dumps(workspace, indent=2) + "\n"
+        root_scripts = json.loads(npm())
+        root_scripts["packages"][""]["scripts"] = {"preinstall": "x"}
+        root_scripts = json.dumps(root_scripts, indent=2) + "\n"
+        bad_link = workspace.replace('"resolved": "packages/a"', '"resolved": "https:evil.example/a"')
+        uv = lambda url: ('[[package]]\nname = "x"\nversion = "1.0.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+                          'sdist = { url = "%s", hash = "sha256:aa" }\n' % url)
+        pypi = "https://files.pythonhosted.org/packages/aa/bb/x-1.0.0.tar.gz"
+        berry_entry = lambda extra: '"x@npm:^1.0.0":\n  version: 1.0.0\n  resolution: "x@npm:1.0.0"\n' + extra
+        bun = lambda entry: ('{\n  // Bun lockfiles are JSONC.\n  "lockfileVersion": 1,\n  "packages": {\n'
+                             '    "x": %s,\n  },\n}\n' % entry)
         rows = [
-            ("package-lock.json", "a registry bump", npm(), npm("https://registry.npmjs.org/x/-/x-1.0.1.tgz"), []),
+            ("package-lock.json", "a registry bump", npm(), bump, []),
             ("package-lock.json", "a URL behind JSON escapes", npm(), npm("https://evil.example/x.tgz").replace(
-                "https://evil.example/x.tgz", "https:\\/\\/evil.example\\/x.tgz"), ["evil.example"]),
+                "https://evil.example/x.tgz", "https:\\/\\/evil.example\\/x.tgz"), ["evil.example", not_registry("x")]),
             ("package-lock.json", "a GitHub tarball", npm(), npm("https://codeload.github.com/e/x/tar.gz/abc"),
-             ["codeload.github.com"]),
+             ["codeload.github.com", not_registry("x")]),
             ("package-lock.json", "a git checkout over ssh", npm(), npm("git+ssh://git@evil.example/x.git#abc"),
-             ["git+ssh://git@evil.example"]),
+             ["git+ssh://git@evil.example", not_registry("x")]),
             ("package-lock.json", "funding links and deprecation notes are not sources", npm(),
              npm(funding={"url": "https://opencollective.com/x"}, deprecated="see https://docs.example.org"), []),
             ("package-lock.json", "a v1 package named funding", v1({"y": reg_v1}),
-             v1({"y": reg_v1, "funding": {"version": "github:evil/x#abc", "from": "github:evil/x"}}), ["github:evil"]),
+             v1({"y": reg_v1, "funding": {"version": "github:evil/x#abc", "from": "github:evil/x"}}),
+             ["github:evil", not_registry("funding")]),
             ("Cargo.lock", "a crates.io bump", cargo("1.0.0", crates), cargo("1.0.1", crates), []),
             ("Cargo.lock", "a git source behind TOML escapes", cargo("1.0.0", crates),
-             cargo("1.0.0", '"git+https:\\u002F\\u002Fevil.example/x#abc"'), ["git+https://evil.example"]),
+             cargo("1.0.0", '"git+https:\\u002F\\u002Fevil.example/x#abc"'), ["git+https://evil.example", "git+https://u002f"]),
             ("poetry.lock", "a URL split by a multi-line string", None, poetry_git, ["evil.example"]),
             ("requirements.txt", "a hashed pin bump", "x==1.0 \\\n    --hash=sha256:aa\n",
              "x==1.1 \\\n    --hash=sha256:bb\n", []),
@@ -1647,7 +1669,7 @@ class LockfileSources(Branch):
             ("requirements.txt", "another requirements file pulled in", "x==1.0\n", "x==1.0\n-r extra.txt\n",
              ["a pip line that is not a package on the index: -r extra.txt"]),
             ("yarn.lock", "an escaped URL", yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz",
-             yarn % "https:\\/\\/evil.example\\/x.tgz", ["an escape or a tag in yarn.lock"]),
+             yarn % "https:\\/\\/evil.example\\/x.tgz", ["an escape or a tag in yarn.lock", "evil.example"]),
             ("yarn.lock", "a Yarn 2 protocol is not a host", berry("1.0.0"), berry("1.0.1"), []),
             ("yarn.lock", "a comment line in a Yarn 2 lockfile", berry("1.0.0"),
              "# Manual changes might be lost - proceed with caution!\n" + berry("1.0.1"), []),
@@ -1661,10 +1683,110 @@ class LockfileSources(Branch):
             ("mix.lock", "a hex bump", mix % '"1.0.0"', mix % '"1.0.1"', []),
             ("mix.lock", "code in mix.lock", mix % '"1.0.0"', mix % '"1.0." <> "1"', ["Elixir code in mix.lock"]),
             ("mix.lock", "a git dependency on GitHub", mix % '"1.0.0"', mix_git, ["github.com"]),
+            # npm reads `resolved` as a spec: a bare `owner/repo` is a GitHub checkout.
+            ("package-lock.json", "a bare GitHub shorthand", npm(), npm("e/x#" + "a" * 40), [not_registry("x")]),
+            # and parses URLs the WHATWG way, `https:host` being https://host.
+            ("package-lock.json", "a URL without its slashes", npm(), npm("https:evil.example/x.tgz"),
+             ["evil.example", not_registry("x")]),
+            ("package-lock.json", "another package's tarball on the registry", npm(),
+             npm("https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"), [not_registry("x")]),
+            ("package-lock.json", "a Python sdist", npm(), npm(pypi), ["files.pythonhosted.org", not_registry("x")]),
+            ("package-lock.json", "an alias names the package it installs", npm(),
+             npm("https://registry.npmjs.org/y/-/y-1.0.0.tgz", name="y"), []),
+            ("package-lock.json", "an alias with another package's tarball", npm(),
+             npm("https://registry.npmjs.org/evil/-/evil-1.0.0.tgz", name="y"), [not_registry("x")]),
+            ("bun.lock", "nested scoped packages and a bin path", bun('["x@1.0.0", "", {}, "sha512-AAAA=="]'),
+             bun('["x@1.0.1", "", { "bin": "bin/x" }, "sha512-BBBB=="],\n    "x/@types/node": ["@types/node@20.0.0", "", {}, "sha512-CCCC=="]'), []),
+            ("pnpm-lock.yaml", "a package named ws and a workspace named ssh", pnpm % "{integrity: sha512-AAAA}",
+             pnpm % "{integrity: sha512-AAAA}\n    dependencies:\n      ws: 8.18.0\n\n  packages/ssh:\n    resolution: {directory: packages/ssh, type: directory}", []),
+            ("package-lock.json", "a dependency spec naming a checkout", npm(), npm(dependencies={"y": "e/y"}),
+             ["node_modules/x in package-lock.json (a dependency spec that is not a registry version)"]),
+            ("package-lock.json", "a source the base has elsewhere is still new here", meta(npm()), hidden,
+             ["evil.example", not_registry("x")]),
+            ("package-lock.json", "a workspace, its link and a bundled package", npm(), workspace, []),
+            ("package-lock.json", "a link to a URL", npm(), bad_link, ["evil.example", not_registry("a")]),
+            ("uv.lock", "a PyPI file", None, uv(pypi), []),
+            ("uv.lock", "a URL without its slashes", uv(pypi), uv("https:evil.example/x-1.0.0.tar.gz"), ["evil.example"]),
+            ("uv.lock", "a crate in a Python lock", uv(pypi), uv("https://static.crates.io/crates/x/x-1.0.0.crate"),
+             ["static.crates.io"]),
+            ("yarn.lock", "a bare GitHub shorthand as the resolution", berry("1.0.0"),
+             '"x@npm:^1.0.0":\n  version: 1.0.0\n  resolution: "x@e/x#commit=abc"\n', ["a GitHub checkout: e/x#commit=abc"]),
+            ("yarn.lock", "a dependency range naming a checkout", berry("1.0.0"),
+             berry_entry("  dependencies:\n    y: e/y\n"), ["a GitHub checkout: e/y"]),
+            ("yarn.lock", "the commands a package installs and its checksum", berry("1.0.0"),
+             berry_entry("  bin:\n    tsc: bin/tsc\n  checksum: 10c0/0123abcd\n"), []),
+            ("yarn.lock", "a bare GitHub shorthand in Yarn 1", yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz",
+             yarn % "e/x#abc", ["a GitHub checkout: e/x#abc"]),
+            ("yarn.lock", "a git URL without slashes", yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz",
+             yarn % "git:evil.example/x#abc", ["a git URL"]),
+            ("bun.lock", "a registry bump", bun('["x@1.0.0", "", {}, "sha512-AAAA=="]'),
+             bun('["x@1.0.1", "", { "bin": { "x": "bin/x" } }, "sha512-BBBB=="]'), []),
+            ("bun.lock", "a bare GitHub shorthand", bun('["x@1.0.0", "", {}, "sha512-AAAA=="]'),
+             bun('["x@e/x#abc", "", {}, "sha512-AAAA=="]'), ["a GitHub checkout: e/x#abc"]),
+            ("bun.lock", "a package given twice", bun('["x@1.0.0", "", {}, "sha512-AAAA=="]'),
+             bun('["x@1.0.0", "", {}, "sha512-AAAA=="],\n    "x": ["x@e/x#abc", "", {}, "sha512-AAAA=="]'),
+             ["a bun.lock that does not parse"]),
+            ("pnpm-lock.yaml", "a git resolution", pnpm % "{integrity: sha512-AAAA}",
+             pnpm % "{type: git, repo: e/x, commit: abc}", ["a git checkout in pnpm-lock.yaml"]),
+            ("pnpm-lock.yaml", "a git resolution named by an alias", pnpm % "{integrity: sha512-AAAA}",
+             "lockfileVersion: '9.0'\nsettings: {g: &g git}\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      commit: abc\n"
+             "      type: *g\n", ["an escape or a tag in pnpm-lock.yaml"]),
+            ("bun.lock", "a dependency named bin", bun('["x@1.0.0", "", {}, "sha512-AAAA=="]'),
+             bun('["x@1.0.0", "", { "dependencies": { "bin": "e/x" } }, "sha512-AAAA=="]'), ["a GitHub checkout: e/x"]),
+            ("uv.lock", "a tab inside the URL", uv(pypi), uv("https:\\t//evil.example/x-1.0.0.tar.gz"), ["evil.example", "t"]),
+            ("package-lock.json", "install scripts on the project's own entry", npm(),
+             root_scripts,
+             ["the project in package-lock.json (not a registry release)"]),
         ]
         for name, why, before, after, want in rows:
             with self.subTest(name=name, why=why):
                 self.assertEqual(self.sources(name, before, after), want)
+
+    def test_a_string_is_matched_only_with_the_same_place_in_the_base(self):
+        evil = "https://evil.example/x.tgz"
+        lock = lambda resolved: json.dumps({"lockfileVersion": 3, "x-meta": {"resolved": evil}, "packages": {
+            "node_modules/x": {"version": "1.0.0", "resolved": resolved}}})
+        fresh = (V.lock_strings("package-lock.json", lock(evil))
+                 - V.lock_strings("package-lock.json", lock("https://registry.npmjs.org/x/-/x-1.0.0.tgz")))
+        self.assertEqual(fresh, {(("packages", "node_modules/x", "resolved"), evil)})
+
+    def test_without_ci_an_npm_entry_is_the_registrys_own_tarball_of_that_package(self):
+        def lock(resolved, version="1.2.4", **extra):
+            return json.dumps({"name": "app", "lockfileVersion": 3, "packages": {
+                "": {"name": "app", "dependencies": {"x": "^1.2.0"}},
+                "node_modules/x": dict({"version": version, "resolved": resolved, "integrity": "sha512-b"}, **extra)}},
+                indent=2) + "\n"
+        base = lock("https://registry.npmjs.org/x/-/x-1.2.3.tgz", "1.2.3")
+        rows = [
+            ("its own tarball", lock("https://registry.npmjs.org/x/-/x-1.2.4.tgz"), True),
+            ("the Yarn mirror", lock("https://registry.yarnpkg.com/x/-/x-1.2.4.tgz"), True),
+            ("another package's tarball", lock("https://registry.npmjs.org/evil/-/evil-1.2.4.tgz"), False),
+            ("another version's tarball", lock("https://registry.npmjs.org/x/-/x-1.2.3.tgz"), False),
+            ("a Python sdist", lock("https://files.pythonhosted.org/packages/aa/x-1.2.4.tar.gz"), False),
+            ("an alias names the package it installs", lock("https://registry.npmjs.org/y/-/y-1.2.4.tgz", name="y"), True),
+            ("an alias with another package's tarball", lock("https://registry.npmjs.org/evil/-/evil-1.2.4.tgz", name="y"), False),
+            ("a URL without its slashes", lock("https:registry.npmjs.org/x/-/x-1.2.4.tgz"), False),
+        ]
+        for label, after, want in rows:
+            with self.subTest(label):
+                self.assertEqual(V.lock_ok("package-lock.json", base, after), want)
+
+    def test_without_ci_a_uv_file_is_a_pypi_file_of_that_package(self):
+        def lock(url, version="1.0.1"):
+            return ('[[package]]\nname = "x-y"\nversion = "%s"\nsource = { registry = "https://pypi.org/simple" }\n'
+                    'sdist = { url = "%s", hash = "sha256:bb" }\n' % (version, url))
+        files = "https://files.pythonhosted.org/packages/aa/bb/"
+        base = lock(files + "x_y-1.0.0.tar.gz", "1.0.0")
+        rows = [
+            ("its own sdist", lock(files + "x_y-1.0.1.tar.gz"), True),
+            ("its own wheel", lock(files + "x_y-1.0.1-py3-none-any.whl"), True),
+            ("another package's wheel", lock(files + "evil-1.0.1-py3-none-any.whl"), False),
+            ("an npm tarball", lock("https://registry.npmjs.org/x-y/-/x-y-1.0.1.tgz"), False),
+            ("another package's file behind a query", lock(files + "evil-1.0.1-py3-none-any.whl?/x_y-1.0.1.tar.gz"), False),
+        ]
+        for label, after, want in rows:
+            with self.subTest(label):
+                self.assertEqual(V.lock_ok("uv.lock", base, after), want)
 
 
 if __name__ == "__main__":
