@@ -2476,11 +2476,11 @@ def pnpm_rows(text):
 
 def pnpm_v5(rows):
     """True for a pnpm-lock.yaml in the format of lockfile v5 and before, where a peer suffix follows `_`
-    and an alias is `/name/version`. From v6 on, `_` can only be part of a package name."""
+    and an alias is `/name/version`. From v6 on, `_` can only be part of a package name. Only a version
+    written plainly counts: YAML reads `0_9.1` as 9.1, and pnpm reads that file as v9."""
     for parents, key, value in rows:
         if not parents and key == "lockfileVersion":
-            m = re.match(r"(\d+)", value or "")
-            return bool(m) and int(m.group(1)) < 6
+            return bool(re.fullmatch(r"[1-5](?:\.\d+)?", value or ""))
     return False
 
 

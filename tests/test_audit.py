@@ -1833,6 +1833,8 @@ class LockfileSources(Branch):
             ("pnpm-lock.yaml", "a package whose name starts like a version", pnpm_dep("^1.0.0", "1.0.0"),
              pnpm_dep("^1.0.0", "1.0.0_evil@1.0.0"), [alias]),
             ("pnpm-lock.yaml", "a peer suffix in lockfile v5", v5_dep("1.0.0"), v5_dep("1.0.0_react@18.0.0"), []),
+            ("pnpm-lock.yaml", "a version YAML reads as 9.1", pnpm_dep("^1.0.0", "1.0.0"),
+             pnpm_dep("^1.0.0", "1.0.0_evil@1.0.0").replace("'9.0'", "0_9.1"), [alias]),
             ("pnpm-lock.yaml", "another package in lockfile v5", v5_dep("1.0.0"), v5_dep("/evil/1.0.0"), [alias]),
             # pnpm takes an entry's fields from `snapshots` when `packages` leaves them out, and downloads the
             # variant of a resolution that matches the platform.
