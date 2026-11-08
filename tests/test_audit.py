@@ -1643,6 +1643,18 @@ class LockfileSources(Branch):
         berry_entry = lambda extra: '"x@npm:^1.0.0":\n  version: 1.0.0\n  resolution: "x@npm:1.0.0"\n' + extra
         bun = lambda entry: ('{\n  // Bun lockfiles are JSONC.\n  "lockfileVersion": 1,\n  "packages": {\n'
                              '    "x": %s,\n  },\n}\n' % entry)
+        patch_entry = lambda source: ('"x@npm:^1.0.0":\n  version: 1.0.0\n'
+                                      '  resolution: "x@patch:%s#./p.patch::version=1.0.0"\n' % source)
+        builtin = ('"typescript@patch:typescript@npm%3A^5.4.0#optional!builtin<compat/typescript>":\n  version: 5.4.2\n'
+                   '  resolution: "typescript@patch:typescript@npm%3A5.4.2#optional!builtin<compat/typescript>'
+                   '::version=5.4.2&hash=5adc0c"\n')
+        pnpm_git = lambda typed: ("lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n%s"
+                                  "      repo: evil.example:x\n      commit: abc\n" % typed)
+        pnpm_notes = ("lockfileVersion: '9.0'\n\noverrides:\n  glob@>=10.3.7 <=11.0.3: ^11.1.0\n\npackages:\n\n"
+                      "  x@1.0.0:\n    resolution: {integrity: sha512-AAAA}\n    deprecated: |-\n      Use y instead.\n\n"
+                      "      (See the y docs, version 2.)\n\n  y@1.0.0:\n    resolution: {integrity: sha512-BBBB}\n"
+                      "    deprecated: Please upgrade!\n")
+        reg_x = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/x/-/x-1.0.0.tgz"}
         rows = [
             ("package-lock.json", "a registry bump", npm(), bump, []),
             ("package-lock.json", "a URL behind JSON escapes", npm(), npm("https://evil.example/x.tgz").replace(
@@ -1669,7 +1681,8 @@ class LockfileSources(Branch):
             ("requirements.txt", "another requirements file pulled in", "x==1.0\n", "x==1.0\n-r extra.txt\n",
              ["a pip line that is not a package on the index: -r extra.txt"]),
             ("yarn.lock", "an escaped URL", yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz",
-             yarn % "https:\\/\\/evil.example\\/x.tgz", ["an escape or a tag in yarn.lock", "evil.example"]),
+             yarn % "https:\\/\\/evil.example\\/x.tgz",
+             ["a line Yarn does not write in yarn.lock", "an escape or a tag in yarn.lock", "evil.example"]),
             ("yarn.lock", "a Yarn 2 protocol is not a host", berry("1.0.0"), berry("1.0.1"), []),
             ("yarn.lock", "a comment line in a Yarn 2 lockfile", berry("1.0.0"),
              "# Manual changes might be lost - proceed with caution!\n" + berry("1.0.1"), []),
@@ -1677,9 +1690,10 @@ class LockfileSources(Branch):
             ("pnpm-lock.yaml", "a deprecation notice is read like any other line", pnpm % "{integrity: sha512-AAAA}",
              pnpm % "{integrity: sha512-AAAA}\n    deprecated: 'see https://docs.example.org'", ["docs.example.org"]),
             ("pnpm-lock.yaml", "a source set on the line of a notice", pnpm % "{integrity: sha512-AAAA}", pnpm_flow,
-             ["evil.example"]),
+             ["a line pnpm does not write in pnpm-lock.yaml", "evil.example"]),
             ("pnpm-lock.yaml", "a binary tag", pnpm % "{integrity: sha512-AAAA}",
-             pnpm % "{tarball: !!binary aHR0cHM6Ly9ldmlsLmV4YW1wbGUveC50Z3o=}", ["an escape or a tag in pnpm-lock.yaml"]),
+             pnpm % "{tarball: !!binary aHR0cHM6Ly9ldmlsLmV4YW1wbGUveC50Z3o=}",
+             ["a line pnpm does not write in pnpm-lock.yaml"]),
             ("mix.lock", "a hex bump", mix % '"1.0.0"', mix % '"1.0.1"', []),
             ("mix.lock", "code in mix.lock", mix % '"1.0.0"', mix % '"1.0." <> "1"', ["Elixir code in mix.lock"]),
             ("mix.lock", "a git dependency on GitHub", mix % '"1.0.0"', mix_git, ["github.com"]),
@@ -1730,13 +1744,44 @@ class LockfileSources(Branch):
              pnpm % "{type: git, repo: e/x, commit: abc}", ["a git checkout in pnpm-lock.yaml"]),
             ("pnpm-lock.yaml", "a git resolution named by an alias", pnpm % "{integrity: sha512-AAAA}",
              "lockfileVersion: '9.0'\nsettings: {g: &g git}\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      commit: abc\n"
-             "      type: *g\n", ["an escape or a tag in pnpm-lock.yaml"]),
+             "      type: *g\n", ["a line pnpm does not write in pnpm-lock.yaml"]),
             ("bun.lock", "a dependency named bin", bun('["x@1.0.0", "", {}, "sha512-AAAA=="]'),
              bun('["x@1.0.0", "", { "dependencies": { "bin": "e/x" } }, "sha512-AAAA=="]'), ["a GitHub checkout: e/x"]),
             ("uv.lock", "a tab inside the URL", uv(pypi), uv("https:\\t//evil.example/x-1.0.0.tar.gz"), ["evil.example", "t"]),
             ("package-lock.json", "install scripts on the project's own entry", npm(),
              root_scripts,
              ["the project in package-lock.json (not a registry release)"]),
+            # Yarn 2 reads YAML and Yarn 1 its own format: a line holds one whole entry only as Yarn writes it.
+            ("yarn.lock", "a resolution beside a checksum in a flow mapping", berry("1.0.0"),
+             '"x@npm:^1.0.0": {\n  checksum: "", resolution: "x@e/x#commit=abc",\n  version: 1.0.0 }\n',
+             ["a GitHub checkout: e/x#commit=abc", "a line Yarn does not write in yarn.lock"]),
+            ("yarn.lock", "a second pair on an integrity line in Yarn 1", yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz",
+             yarn % "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz" + "  integrity sha512-AAAA resolved e/x#abc\n",
+             ["a GitHub checkout: e/x#abc", "a line Yarn does not write in yarn.lock"]),
+            ("yarn.lock", "a carriage return inside a comment line", berry("1.0.0"),
+             berry_entry('# note\r  resolution: "x@e/x#commit=abc"\n'),
+             ["a GitHub checkout: e/x#commit=abc", "a line Yarn does not write in yarn.lock"]),
+            # Yarn percent-decodes the source a patch wraps.
+            ("yarn.lock", "a URL in a patch, percent-encoded", berry("1.0.0"),
+             patch_entry("x@https%3A//evil.example/x.tgz"), ["evil.example"]),
+            ("yarn.lock", "a GitHub checkout in a patch, percent-encoded", berry("1.0.0"),
+             patch_entry("x@e%2Fx%23commit%3Dabc"), ["a GitHub checkout: e/x#commit=abc#./p.patch::version=1.0.0"]),
+            ("yarn.lock", "a built-in patch", berry("1.0.0"), berry("1.0.0") + builtin, []),
+            ("pnpm-lock.yaml", "a git type on the line below its key", pnpm % "{integrity: sha512-AAAA}",
+             pnpm_git("      type:\n        git\n"),
+             ["a git checkout in pnpm-lock.yaml", "a line pnpm does not write in pnpm-lock.yaml"]),
+            ("pnpm-lock.yaml", "a git type in a block scalar", pnpm % "{integrity: sha512-AAAA}",
+             pnpm_git("      type: |-\n        git\n"),
+             ["a git checkout in pnpm-lock.yaml", "a line pnpm does not write in pnpm-lock.yaml"]),
+            ("pnpm-lock.yaml", "pnpm's own notices and a key with spaces", pnpm % "{integrity: sha512-AAAA}",
+             pnpm_notes, []),
+            # npm reads no `name` in the v1 tree.
+            ("package-lock.json", "a v1 entry naming another package", v1({"x": reg_x}),
+             v1({"x": dict(reg_x, name="evil", resolved="https://registry.npmjs.org/evil/-/evil-1.0.0.tgz")}),
+             [not_registry("x")]),
+            ("package-lock.json", "a v1 alias", v1({"y": reg_v1}),
+             v1({"y": reg_v1, "x": {"version": "npm:z@1.0.0", "resolved": "https://registry.npmjs.org/z/-/z-1.0.0.tgz"}}),
+             []),
         ]
         for name, why, before, after, want in rows:
             with self.subTest(name=name, why=why):
@@ -1766,6 +1811,22 @@ class LockfileSources(Branch):
             ("an alias names the package it installs", lock("https://registry.npmjs.org/y/-/y-1.2.4.tgz", name="y"), True),
             ("an alias with another package's tarball", lock("https://registry.npmjs.org/evil/-/evil-1.2.4.tgz", name="y"), False),
             ("a URL without its slashes", lock("https:registry.npmjs.org/x/-/x-1.2.4.tgz"), False),
+        ]
+        for label, after, want in rows:
+            with self.subTest(label):
+                self.assertEqual(V.lock_ok("package-lock.json", base, after), want)
+
+    def test_without_ci_a_v1_entry_is_the_package_of_its_folder(self):
+        def lock(**x):
+            return json.dumps({"name": "app", "lockfileVersion": 1, "dependencies": {"x": x}}, indent=2) + "\n"
+        base = lock(version="1.2.3", resolved="https://registry.npmjs.org/x/-/x-1.2.3.tgz")
+        rows = [
+            ("its own tarball", lock(version="1.2.4", resolved="https://registry.npmjs.org/x/-/x-1.2.4.tgz"), True),
+            ("another package's tarball under a name npm does not read",
+             lock(version="1.2.3", name="evil", resolved="https://registry.npmjs.org/evil/-/evil-1.2.3.tgz"), False),
+            ("an alias", lock(version="npm:y@1.2.4", resolved="https://registry.npmjs.org/y/-/y-1.2.4.tgz"), True),
+            ("an alias with another package's tarball",
+             lock(version="npm:y@1.2.4", resolved="https://registry.npmjs.org/evil/-/evil-1.2.4.tgz"), False),
         ]
         for label, after, want in rows:
             with self.subTest(label):

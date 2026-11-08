@@ -41,6 +41,7 @@ import time
 import tomllib
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -1061,23 +1062,48 @@ LOCK_HOSTS.update({"Cargo.lock": {"static.crates.io", "crates.io", "index.crates
 # alone as a dependency's range.
 BARE_GITHUB = re.compile(r"(?!\.{1,2}/)[A-Za-z0-9._-]+/(?!\.{1,2}(?:#|$))[A-Za-z0-9._-]+?(?:\.git)?(?:#.*)?")
 JS_WORD = re.compile(r"""[^\s"',\[\]{}()]+""")
-# yarn.lock lines whose values are hashes, not sources: a checksum (Yarn 2 writes `10c0/<hex>`) and an
-# integrity hash.
-YARN_HASH_LINE = re.compile(r"""^\s*"?(?:checksum|integrity)"?\s*:?\s""")
+# A yarn.lock line as Yarn writes it, the only form read here, so that each line holds one whole entry: a
+# key (in Yarn 1 several, sharing a value) with a colon and maybe a value, plain words or a quoted string, or
+# in Yarn 1 a key, a space and a one-word value. The YAML that Yarn 2 and later read, and Yarn 1's own
+# reader, take more: a flow mapping (`{checksum: x, resolution: y}` on one line), a string or value that runs
+# on to the next line, a tag, an anchor or an alias, an escape, a carriage return (a line break to both),
+# and in Yarn 1 more `key value` pairs after the first. Each of those puts a value where a reader of single
+# lines would not look for it.
+YARN_QUOTED = r'"[^"\\\x00-\x1f\x7f]*"'
+YARN_KEY = YARN_QUOTED + r"""|[^\s"'#,:\[\]{}&*!|>%@`?\\-][^\s"'#,:\[\]{}\\]*"""
+YARN_LINE = re.compile(
+    r""" *(?:(?P<keys>(?:%s)(?:, (?:%s))*):(?: (?P<value>%s|[^\s"'#,:\[\]{}&*!|>%%@`?\\-]"""
+    r"""(?:[^\s"'#,:\[\]{}\\]| +(?=[^\s"'#,:\[\]{}\\]))*))?|(?P<key>%s) (?P<word>%s|[^\s"'#,:\[\]{}\\]+))\r?"""
+    % (YARN_KEY, YARN_KEY, YARN_QUOTED, YARN_KEY, YARN_QUOTED))
+# A pnpm-lock.yaml line as pnpm writes it, likewise: a key (plain, which may hold spaces, or quoted) with a
+# colon and maybe a value, or a list item, where a value is a plain or quoted string or a flow mapping or
+# list closed on that line; and `---` before each of the two documents pnpm 11 writes. pnpm writes a
+# multi-line deprecation notice as a block scalar (`deprecated: |-`), whose lines are its text. Anything
+# else can carry a value on to another line: `type:` with `git` on the line below is a git source.
+PNPM_QUOTED = r"""(?:"[^"\\\x00-\x1f\x7f]*"|'(?:[^'\x00-\x1f\x7f]|'')*')"""
+YAML_START = r"""[^\s"'#,:\[\]{}&*!|>%@`?\\-]"""
+PNPM_KEY = r"(?:%s|%s(?:[^\s:#\\]|:(?=\S)|(?<=\S)#| +(?=[^\s:#\\]))*)" % (PNPM_QUOTED, YAML_START)
+PNPM_FLOW_KEY = r"(?:%s|%s(?:[^\s,\[\]{}:#\\]|:(?=[^\s,\[\]{}]))*)" % (PNPM_QUOTED, YAML_START)
+PNPM_FLOW_VALUE = (r"(?:%s|%s(?:[^\s,\[\]{}:#\\]|:(?=[^\s,\[\]{}])|(?<=\S)#| +(?=[^\s,\[\]{}:#\\]))*)"
+                   % (PNPM_QUOTED, YAML_START))
+PNPM_VALUE = (r"(?:%s|\{(?:%s: %s(?:, %s: %s)*)?\}|\[(?:%s(?:, %s)*)?\]|%s(?:[^\s:#\\]|:(?=\S)|(?<=\S)#"
+              r"| +(?=[^\s#\\]))*)" % (PNPM_QUOTED, PNPM_FLOW_KEY, PNPM_FLOW_VALUE, PNPM_FLOW_KEY,
+                                      PNPM_FLOW_VALUE, PNPM_FLOW_VALUE, PNPM_FLOW_VALUE, YAML_START))
+PNPM_LINE = re.compile(r"(?:---| *(?:- )?%s:(?: %s)?| *- %s)\r?" % (PNPM_KEY, PNPM_VALUE, PNPM_VALUE))
+PNPM_NOTICE = re.compile(r" *deprecated: [|>][-+]?\r?")
 # pnpm writes a git source as `resolution: {type: git, repo: ..., commit: ...}`, and git clones whatever
-# string `repo` holds.
-PNPM_GIT = re.compile(r"[{,]\s*['\"]?repo['\"]?\s*:|\btype['\"]?\s*:\s*['\"]?git\b")
+# string `repo` holds; YAML also takes the mapping as a block, a field a line.
+PNPM_GIT = re.compile(r"[{,]\s*['\"]?repo['\"]?\s*:|^\s*['\"]?repo['\"]?: +\S|\btype['\"]?\s*:\s*['\"]?git\b")
 # Cargo names crates.io by its index on GitHub. Any other GitHub address in a lockfile is a checkout or a
 # source tarball, which runs that code's build and install scripts like any other foreign source.
 CRATES_INDEX = re.compile(r"registry\+https://github\.com/rust-lang/crates\.io-index(?=[\"')\s]|\Z)")
 JSON_LOCKS = {"package-lock.json", "npm-shrinkwrap.json", "Pipfile.lock"}
 TOML_LOCKS = {"uv.lock", "poetry.lock", "Cargo.lock"}
-# What hides text from a scan of lines in the formats read line by line: an escape, in YAML also a tag
-# (`!!binary` turns base64 into the text), an anchor or an alias (`*a` stands for text set elsewhere)
-# outside a comment line, and in a POM a character reference or an entity.
-YAML_HIDDEN = re.compile(r"^(?!\s*#).*?(?:\\|!|(?:^|[\s\[{,:-])[&*][^\s,\[\]{}]+)")
-HIDDEN_TEXT = {"pnpm-lock.yaml": YAML_HIDDEN, "yarn.lock": YAML_HIDDEN,
-               "pom.xml": re.compile(r"&#|<!ENTITY", re.I)}
+# What hides text from a scan of lines in the formats read line by line: an escape, and in a POM a
+# character reference or an entity. YAML's tags (`!!binary` turns base64 into the text), anchors and aliases
+# (`*a` stands for text set elsewhere) are kept out of yarn.lock and pnpm-lock.yaml by YARN_LINE and
+# PNPM_LINE, which take a `!` or `*` only inside a string, where it is text.
+HIDDEN_TEXT = {"pom.xml": re.compile(r"&#|<!ENTITY", re.I)}
 BACKSLASH = re.compile(r"\\")
 # Mix reads mix.lock by evaluating it as Elixir, so each line of it must be plain data: strings without
 # escapes or interpolation, atoms, keyword keys, numbers, true/false/nil and brackets. Anything else (a
@@ -1115,35 +1141,87 @@ def bare_github(text, key=False):
     return {"a GitHub checkout: " + c for c in found if BARE_GITHUB.fullmatch(c)}
 
 
-def yarn_bare_sources(lines):
-    """The bare GitHub shorthands on the added lines of a yarn.lock diff, keys left out as whole words.
-    Checksums and integrity hashes are not read, nor the commands a package installs (`tsc: bin/tsc`),
-    which sit in a `bin:` block: Yarn reads the file by indentation, and the diff's context lines give the
-    less indented lines above an added one."""
+def decoded(text):
+    """`text`, then each percent-decoding of it until nothing changes: Yarn decodes the source a `patch:`
+    range wraps (`x@patch:x@npm%3A1.0.0#...`), and a patch can wrap a patch."""
+    layers = [text]
+    while urllib.parse.unquote(layers[-1]) != layers[-1]:
+        layers.append(urllib.parse.unquote(layers[-1]))
+    return layers
+
+
+def yarn_words(words, key):
+    return {s for word in words for layer in decoded(word) for part in JS_WORD.findall(layer)
+            for s in bare_github(part, key)}
+
+
+def yarn_sources(lines):
+    """What the added lines of a yarn.lock diff name that Yarn would fetch, past the URLs in their raw text:
+    a line Yarn does not write (YARN_LINE), which is then read word by word, the URLs in a line's
+    percent-decoded text, and a bare GitHub shorthand, raw or decoded, in a key only after an `@`. A
+    checksum's or an integrity hash's own value is not read, nor anything in a `bin:` block (the commands a
+    package installs, `tsc: bin/tsc`): Yarn reads the file by indentation, and the diff's context lines give
+    the less indented lines above an added one."""
     found, parents, hunk = set(), [], False
     for line in lines:
         if line.startswith("@@"):
             parents, hunk = [], True
             continue
-        if not hunk or line[:1] not in "+ ":
+        if not hunk or line[:1] not in ("+", " "):
             continue
-        body = line[1:]
-        text = body.strip()
-        if not text or text.startswith("#"):
+        body, added = line[1:], line[0] == "+"
+        if added:
+            for layer in decoded(body)[1:]:
+                found |= named_sources(layer, LOCK_HOSTS["yarn.lock"])
+        one_line = "\r" not in body.rstrip("\r")
+        if one_line and (not body.strip() or body.lstrip(" ").startswith("#")):
             continue
-        indent = len(body) - len(body.lstrip())
+        m = YARN_LINE.fullmatch(body) if one_line else None
+        if not m:
+            parents = []
+            if added:
+                found.add("a line Yarn does not write in yarn.lock")
+                found |= yarn_words(JS_WORD.findall(body), False)
+            continue
+        indent = len(body) - len(body.lstrip(" "))
         while parents and parents[-1][0] >= indent:
             parents.pop()
-        in_bin = any(key == "bin" for _, key in parents)
-        if text.endswith(":"):
-            parents.append((indent, text.split()[0].strip("\"':")))
-        if line[0] != "+" or in_bin or YARN_HASH_LINE.match(body):
+        keys, value = m.group("keys") or m.group("key"), m.group("value") or m.group("word")
+        if value is None:
+            parents.append((indent, keys.strip('"')))
+        if not added or any(key == "bin" for _, key in parents):
             continue
-        for m in JS_WORD.finditer(body):
-            word = m.group(0)
-            key = word.endswith(":") or body[m.end():].lstrip("\"'").startswith(":")
-            found |= bare_github(word.rstrip(":"), key)
+        words = JS_WORD.findall(value or "")
+        if keys.strip('"') in ("checksum", "integrity"):
+            words = words[1:]
+        found |= yarn_words(JS_WORD.findall(keys), True) | yarn_words(words, False)
     return found
+
+
+def pnpm_shape(lines):
+    """A reason when an added line of a pnpm-lock.yaml diff is not one pnpm writes (PNPM_LINE). After a
+    `deprecated:` block scalar starts, a blank line or one more indented than its key is the notice's text."""
+    notice, hunk = None, False
+    for line in lines:
+        if line.startswith("@@"):
+            notice, hunk = None, True
+            continue
+        if not hunk or line[:1] not in ("+", " "):
+            continue
+        body = line[1:]
+        if line[0] == "+" and "\r" in body.rstrip("\r"):
+            return {"a line pnpm does not write in pnpm-lock.yaml"}
+        indent = len(body) - len(body.lstrip(" "))
+        if notice is not None and (not body.strip() or indent > notice):
+            continue
+        notice = None
+        if not body.strip() or body.lstrip(" ").startswith("#"):
+            continue
+        if PNPM_NOTICE.fullmatch(body):
+            notice = indent
+        elif line[0] == "+" and not PNPM_LINE.fullmatch(body):
+            return {"a line pnpm does not write in pnpm-lock.yaml"}
+    return set()
 
 
 def mix_data(line):
@@ -1292,8 +1370,9 @@ def foreign_sources(diff, repo_dir=None, base=None):
     lines, and given `repo_dir` and `base`, those in what the tools read. A line can hide a URL behind an
     escape (`https:\/\/` in JSON, `\u002F` or a multi-line string in TOML, a trailing backslash in a
     requirements file), so a format Python reads is compared as decoded strings, a requirements file as
-    the lines pip joins, and in the formats read line by line a line with an escape counts as foreign.
-    Mix runs mix.lock as Elixir, so a line of it that is not plain data counts too."""
+    the lines pip joins, and in the formats read line by line a line with an escape counts as foreign, as
+    does a yarn.lock or pnpm-lock.yaml line its tool does not write (a value can run on to the next line in
+    YAML). Mix runs mix.lock as Elixir, so a line of it that is not plain data counts too."""
     found = set()
     for path, text in split_diff(diff):
         name = os.path.basename(path) if os.path.basename(path) in LOCKFILES else None
@@ -1308,7 +1387,7 @@ def foreign_sources(diff, repo_dir=None, base=None):
                 continue
             if i not in skip and not (name in NPM_LOCKFILES and NPM_NOTE.match(line)):
                 found |= named_sources(line[1:], LOCK_HOSTS.get(name))
-            if name == "pnpm-lock.yaml" and PNPM_GIT.search(line):
+            if name == "pnpm-lock.yaml" and PNPM_GIT.search(line[1:]):
                 found.add("a git checkout in pnpm-lock.yaml")
             if name == "mix.lock":
                 if not mix_data(line[1:]):
@@ -1316,7 +1395,9 @@ def foreign_sources(diff, repo_dir=None, base=None):
             elif name not in JSON_LOCKS | TOML_LOCKS | {"requirements.txt"} and HIDDEN_TEXT.get(name, BACKSLASH).search(line[1:]):
                 found.add("an escape or a tag in " + name)
         if name == "yarn.lock":
-            found |= yarn_bare_sources(lines)
+            found |= yarn_sources(lines)
+        if name == "pnpm-lock.yaml":
+            found |= pnpm_shape(lines)
         if repo_dir is not None:
             found |= read_sources(repo_dir, base, path, name, text)
     return sorted(found)
@@ -2195,24 +2276,32 @@ NPM_LINK_KEYS = {"resolved", "link", "dev", "optional", "devOptional", "peer"}
 
 
 def npm_release(key, entry, resolved=True):
-    """True when the entry at `key` installs a registry release of the package it names (its `name`, for an
-    alias, else its folder's), which is what the release-age rule looks up: only the fields a release has,
-    a plain version, and as `resolved` the registry's own tarball of that package at that version. Any
-    other file on a registry host is another package, one anybody can publish, which npm would install
-    under the name the rule checked. With `resolved` False a bundled entry passes too (npm takes it from
-    its parent's tarball), and one without a `resolved` (npm fetches it from the registry by name and
-    version)."""
-    path = key[1]
+    """True when the entry at `key` installs a registry release of the package the lock names for it: only
+    the fields a release has, a plain version, and as `resolved` the registry's own tarball of that package
+    at that version.
+    In `packages` the package is the entry's `name` (an alias's), else its folder's. In the `dependencies`
+    tree npm 6 reads (lockfile v1, kept in v2) npm reads no `name`, so there it is the folder's, or for an
+    alias the one its version names (`npm:name@version`). Any other file on a registry host is another
+    package, one anybody can publish, which npm would install under the name that was checked. With
+    `resolved` False a bundled entry passes too (npm takes it from its parent's tarball), and one without a
+    `resolved` (npm fetches it from the registry by name and version)."""
+    section, path = key
     keys = NPM_REGISTRY_KEYS if resolved else NPM_REGISTRY_KEYS | {"inBundle", "bundled"}
     if not (isinstance(entry, dict) and set(entry) <= keys and "node_modules/" in path):
         return False
-    name = entry.get("name") or path.rsplit("node_modules/", 1)[-1]
-    if not (isinstance(name, str) and NPM_NAME.fullmatch(name) and isinstance(entry.get("version"), str)
-            and SEMVER.fullmatch(entry["version"])):
+    name, version = entry.get("name") or path.rsplit("node_modules/", 1)[-1], entry.get("version")
+    if section == "dependencies":
+        if "name" in entry:
+            return False
+        name = path.rsplit("node_modules/", 1)[-1]
+        if isinstance(version, str) and version.startswith("npm:"):
+            name, _, version = version[4:].rpartition("@")
+    if not (isinstance(name, str) and NPM_NAME.fullmatch(name) and isinstance(version, str)
+            and SEMVER.fullmatch(version)):
         return False
     if not resolved and "resolved" not in entry:
         return True
-    tail = "/%s/-/%s-%s.tgz" % (name, name.rsplit("/", 1)[-1], entry["version"])
+    tail = "/%s/-/%s-%s.tgz" % (name, name.rsplit("/", 1)[-1], version)
     return entry.get("resolved") in {"https://" + h + tail for h in NPM_HOSTS}
 
 
